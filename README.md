@@ -186,7 +186,7 @@ flowchart TD
 
 ## 📄 Licencia
 
-Este proyecto es de código abierto bajo licencia MIT.
+Este proyecto es de código abierto bajo licencia GNU General Public License v3.0.
 
 ---
 
