@@ -1,0 +1,25 @@
+# Entorno Virtual
+venv/
+.venv/
+env/
+
+# Python (Archivos compilados y caché)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Configuraciones de entorno locales
+.env
+.venv
+venv
+
+# Archivos locales
+contexto.md
+AGENTS.md
+.opencode
+
+# IDEs (Opcional, limpia archivos de VS Code)
+.vscode/
+.DS_Store
