@@ -6,7 +6,7 @@ Gestiona la restauración de archivos seleccionados con extracción real de payl
 import os
 import platform
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
 from core.scanner import ArchivoEncontrado, obtener_tamano_maximo, es_ruta_dispositivo_bloque
 
@@ -75,14 +75,38 @@ class RecuperadorArchivos:
                 # Ruta de destino
                 ruta_destino = carpeta_tipo / archivo.nombre
 
+                # AUD-005: validar dispositivo antes de extraer y de escribir
+                if not self._destino_distinto_del_origen(archivo, ruta_destino.parent):
+                    print(f"[ERROR] Destino en el mismo dispositivo que el origen: {ruta_destino}")
+                    fallidos += 1
+                    continue
+                if ruta_destino.exists():
+                    print(f"[ERROR] El archivo ya existe, no se sobrescribirá: {ruta_destino}")
+                    fallidos += 1
+                    continue
+
                 # Extraer payload real desde el dispositivo
                 payload_extraido = self._extraer_payload(archivo)
 
                 if payload_extraido and len(payload_extraido) > 0:
-                    # Escribir payload en modo binario estricto
-                    with open(ruta_destino, "wb") as f:
-                        f.write(payload_extraido)
-                    recuperados += 1
+                    # AUD-005: creación exclusiva ('xb') para evitar sobrescrituras y carreras.
+                    # Nunca se usa "wb" sobre una ruta existente.
+                    try:
+                        with open(ruta_destino, "xb") as f:
+                            f.write(payload_extraido)
+                        recuperados += 1
+                    except FileExistsError:
+                        print(f"[ERROR] El archivo apareció durante la recuperación, no se sobrescribirá: {ruta_destino}")
+                        fallidos += 1
+                    except Exception as e:
+                        # Solo se elimina el archivo que ESTA recuperación creó; nunca uno preexistente
+                        try:
+                            if ruta_destino.exists():
+                                ruta_destino.unlink()
+                        except OSError:
+                            pass
+                        print(f"[ERROR] Enviando payload a disco falló {archivo.nombre}: {e}")
+                        fallidos += 1
                 else:
                     print(f"[ADVERTENCIA] No se pudo extraer payload para {archivo.nombre}")
                     fallidos += 1
@@ -143,6 +167,92 @@ class RecuperadorArchivos:
         if "#offset=" in ruta_archivo:
             return ruta_archivo.split("#offset=")[0]
         return ruta_archivo
+
+    def _destino_distinto_del_origen(self, archivo: ArchivoEncontrado, carpeta_destino: Path) -> bool:
+        """
+        Devuelve True solo si se puede afirmar con seguridad que el destino
+        está en un dispositivo distinto del origen del archivo recuperado.
+
+        - Origen regular (POSIX): compara st_dev del archivo origen con el de la
+          carpeta destino (dispositivo de filesystem).
+        - Origen bloque montado (POSIX): compara st_dev del punto de montaje del
+          dispositivo (vía psutil) con el de la carpeta destino.
+        - Windows: compara la letra de unidad; orígenes PhysicalDriveN sin letra
+          se consideran indeterminados.
+        - Si no se puede establecer la identidad con seguridad, devuelve False
+          (fallo seguro).
+
+        Comparar st_dev NO garantiza distinto dispositivo físico en todos los
+        casos (varias particiones pueden compartir disco físico); esta
+        verificación es sobre el dispositivo de filesystem y es deliberada:
+        es la frontera de seguridad trazable desde Python de forma estándar.
+        """
+        ruta_origen = self._extraer_ruta_dispositivo(archivo.ruta)
+        if not ruta_origen or platform.system() == "Windows":
+            return self._destino_distinto_windows(ruta_origen, carpeta_destino)
+        return self._destino_distinto_posix(ruta_origen, carpeta_destino)
+
+    def _destino_distinto_posix(self, ruta_origen: str, carpeta_destino: Path) -> bool:
+        try:
+            dev_destino = self._st_dev_de(carpeta_destino)
+            if dev_destino is None:
+                return False
+            if es_ruta_dispositivo_bloque(ruta_origen):
+                dev_origen = self._st_dev_dispositivo_desde_montaje(ruta_origen)
+            else:
+                dev_origen = os.stat(ruta_origen).st_dev
+            if dev_origen is None:
+                return False
+            return dev_origen != dev_destino
+        except (OSError, PermissionError):
+            return False
+
+    def _st_dev_de(self, ruta: Path) -> Optional[int]:
+        """st_dev de la carpeta destino; si no existe, del ancestro más cercano."""
+        actual = ruta
+        while True:
+            try:
+                return os.stat(actual).st_dev
+            except (OSError, PermissionError):
+                if actual.parent == actual:
+                    return None
+                actual = actual.parent
+
+    def _st_dev_dispositivo_desde_montaje(self, ruta_dispositivo: str) -> Optional[int]:
+        """st_dev del filesystem del dispositivo, localizando su punto de montaje."""
+        try:
+            import psutil
+            for particion in psutil.disk_partitions(all=True):
+                if particion.device == ruta_dispositivo and particion.mountpoint:
+                    try:
+                        return os.stat(particion.mountpoint).st_dev
+                    except (OSError, PermissionError):
+                        continue
+        except Exception:
+            pass
+        return None
+
+    def _destino_distinto_windows(self, ruta_origen: Optional[str], carpeta_destino: Path) -> bool:
+        try:
+            letra_destino = Path(carpeta_destino).drive.upper()
+            if not letra_destino:
+                return False
+            if not ruta_origen:
+                return False
+            origen = ruta_origen
+            if origen.startswith("\\\\.\\"):
+                resto = origen[4:]
+                if len(resto) >= 2 and resto[1] == ":":
+                    letra_origen = resto[:2].upper()
+                    return letra_origen != letra_destino
+                # PhysicalDriveN u otro: indeterminado
+                return False
+            letra_origen = Path(origen).drive.upper()
+            if not letra_origen:
+                return False
+            return letra_origen != letra_destino
+        except Exception:
+            return False
 
     def _extraer_desde_dispositivo(
         self,

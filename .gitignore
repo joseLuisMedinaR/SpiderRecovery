@@ -19,6 +19,7 @@ venv
 contexto.md
 AGENTS.md
 .opencode
+AUDIT_REPORT.md
 
 # IDEs (Opcional, limpia archivos de VS Code)
 .vscode/

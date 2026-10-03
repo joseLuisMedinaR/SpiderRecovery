@@ -23,6 +23,7 @@ class EstadoEscaneo(Enum):
     PAUSADO = "pausado"
     COMPLETADO = "completado"
     CANCELADO = "cancelado"
+    CANCELANDO = "cancelando"
 
 
 @dataclass
@@ -257,6 +258,7 @@ class EscaneoProfundo:
         self._contador_archivos = 0  # Para generar nombres únicos
         self.sistema_operativo = detectar_sistema_operativo()
         self.ruta_dispositivo: str = ""  # Ruta del dispositivo en escaneo
+        self._notificaciones_habilitadas = True  # Evita callbacks tardíos tras finalizar
 
     def registrar_callback(self, callback: Callable):
         """Registra una función a llamar cuando hay actualizaciones."""
@@ -265,6 +267,8 @@ class EscaneoProfundo:
     def _notificar(self):
         """Notifica a todos los callbacks registrados."""
         for callback in self._callbacks:
+            if not self._notificaciones_habilitadas:
+                return
             try:
                 callback(self.progreso, self.archivos_encontrados)
             except Exception:
@@ -280,6 +284,7 @@ class EscaneoProfundo:
         self._contador_archivos = 0
         self._evento_pausa.set()
         self._evento_cancelar.clear()
+        self._notificaciones_habilitadas = True
 
         self._hilo = threading.Thread(
             target=self._escanear,
@@ -307,7 +312,9 @@ class EscaneoProfundo:
         """Cancela el escaneo actual."""
         self._evento_cancelar.set()
         self._evento_pausa.set()  # Asegurar que no esté pausado
-        self.progreso.estado = EstadoEscaneo.CANCELADO
+        # Estado intermedio: el hilo worker finalizará la cancelación
+        if self.progreso.estado in (EstadoEscaneo.ESCANEANDO, EstadoEscaneo.PAUSADO):
+            self.progreso.estado = EstadoEscaneo.CANCELANDO
         self._notificar()
 
     def detener_y_guardar(self):
@@ -325,10 +332,11 @@ class EscaneoProfundo:
         # Señalar al hilo que debe detenerse
         self._evento_cancelar.set()
         self._evento_pausa.set()  # Asegurar que no esté pausado
-        
-        # Actualizar estado
-        self.progreso.estado = EstadoEscaneo.CANCELADO
-        
+
+        # Estado intermedio explícito; el hilo worker publicará CANCELADO al finalizar
+        if self.progreso.estado in (EstadoEscaneo.ESCANEANDO, EstadoEscaneo.PAUSADO):
+            self.progreso.estado = EstadoEscaneo.CANCELANDO
+
         # Notificar a la UI
         self._notificar()
         
@@ -386,9 +394,14 @@ class EscaneoProfundo:
 
         finally:
             self.progreso.tiempo_transcurrido = time.time() - inicio_tiempo
-            if self.progreso.estado != EstadoEscaneo.CANCELADO:
+            # El estado final se decide por el evento de cancelación, nunca se sobrescribe
+            if self._evento_cancelar.is_set():
+                self.progreso.estado = EstadoEscaneo.CANCELADO
+            else:
                 self.progreso.estado = EstadoEscaneo.COMPLETADO
             self._notificar()
+            # A partir de aquí no se aceptan más callbacks del worker
+            self._notificaciones_habilitadas = False
             
             print(f"\n{'='*60}")
             print(f"[FIN] Escaneo completado")

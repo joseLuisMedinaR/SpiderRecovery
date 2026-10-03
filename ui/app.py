@@ -160,7 +160,7 @@ class AppPrincipal(ctk.CTk):
 
         # Configurar escáner
         self.escanner.registrar_callback(
-            self.pantallas["progreso"].actualizar_progreso
+            self.pantallas["progreso"].publicar_actualizacion
         )
 
         # Cambiar a pantalla de progreso

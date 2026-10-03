@@ -3,6 +3,8 @@ Pantalla 2: Progreso del escaneo
 Muestra el progreso en tiempo real con controles de pausa/cancelación
 """
 
+import queue
+
 import customtkinter as ctk
 from typing import Callable, Optional
 
@@ -35,6 +37,11 @@ class PantallaProgreso(ctk.CTkFrame):
         # Variables de estado
         self.escaneo_activo = True
         self._callback_registrado = False
+
+        # Cola thread-safe para transferir actualizaciones del hilo worker al hilo UI
+        self._cola_ui: queue.Queue = queue.Queue()
+        self._id_polling: Optional[str] = None
+        self._iniciar_polling()
 
         # Configurar grid
         self.grid_rowconfigure(1, weight=1)
@@ -240,6 +247,45 @@ class PantallaProgreso(ctk.CTkFrame):
         )
         self.boton_cancelar.pack(side="right")
 
+    def publicar_actualizacion(self, progreso: ProgresoEscaneo, archivos: list[ArchivoEncontrado]):
+        """
+        Callback invocado desde el hilo worker del escáner.
+
+        No toca widgets ni variables de Tkinter; solo encola la actualización
+        para que el hilo principal la procese. Colapsa la cola conservando
+        únicamente las actualizaciones más recientes para evitar crecimiento
+        ilimitado; el último estado siempre queda registrado.
+        """
+        try:
+            self._cola_ui.put_nowait((progreso, archivos))
+            while self._cola_ui.qsize() > 2:
+                try:
+                    self._cola_ui.get_nowait()
+                except queue.Empty:
+                    break
+        except Exception:
+            pass
+
+    def _iniciar_polling(self):
+        """Programa el drenaje periódico de la cola en el hilo principal."""
+        try:
+            self._id_polling = self.after(100, self._procesar_cola)
+        except Exception:
+            self._id_polling = None
+
+    def _procesar_cola(self):
+        """Aplica en el hilo principal las actualizaciones pendientes."""
+        try:
+            while True:
+                progreso, archivos = self._cola_ui.get_nowait()
+                self.actualizar_progreso(progreso, archivos)
+        except queue.Empty:
+            pass
+        except Exception:
+            # No interrumpir el bucle de polling por un error puntual
+            pass
+        self._iniciar_polling()
+
     def actualizar_progreso(
         self,
         progreso: ProgresoEscaneo,
@@ -280,6 +326,20 @@ class PantallaProgreso(ctk.CTkFrame):
         # Resetear botón de pausa cuando el escaneo está activo
         if progreso.estado == EstadoEscaneo.ESCANEANDO:
             self.boton_pausa.configure(text="⏸️ Pausar", state="normal")
+
+        # Estado intermedio de cancelación: bloquear controles hasta finalizar
+        if progreso.estado == EstadoEscaneo.CANCELANDO:
+            self.boton_pausa.configure(state="disabled")
+            self.boton_cancelar.configure(state="disabled")
+            self.boton_ver_parciales.configure(state="disabled")
+            self.label_ruta.configure(text="Cancelando escaneo...")
+
+        # Cancelación finalizada: deshabilitar controles
+        if progreso.estado == EstadoEscaneo.CANCELADO:
+            self.escaneo_activo = False
+            self.boton_pausa.configure(state="disabled")
+            self.boton_cancelar.configure(state="disabled")
+            self.boton_ver_parciales.configure(state="disabled")
 
         # Verificar si el escaneo terminó
         if progreso.estado == EstadoEscaneo.COMPLETADO:
