@@ -14,12 +14,15 @@ __pycache__/
 .env
 .venv
 venv
+tmp
 
 # Archivos locales
 contexto.md
 AGENTS.md
 .opencode
 AUDIT_REPORT.md
+SPIDERRECOVERY_VISION_Y_ROADMAP.md
+roadmap.md
 
 # IDEs (Opcional, limpia archivos de VS Code)
 .vscode/

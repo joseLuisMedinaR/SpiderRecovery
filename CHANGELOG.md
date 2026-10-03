@@ -5,6 +5,65 @@ Todos los cambios notables en este proyecto se documentarán en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/),
 y este proyecto se adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.6.5-alpha] - 2026-10-03
+
+### Añadido
+- Pruebas de robustez del parser/stream JPEG: EOI en múltiples posiciones de borde de 64 KiB, segmento que termina exactamente en el límite de bloque, límite operativo a mitad de marcador, lecturas cortas, error de lectura inyectado, cancelación tras el primer bloque. No se encontraron defectos reproducibles en la auditoría; el comportamiento existente se preservó y se cubrió con regresiones.
+
+---
+
+## [1.6.4-alpha] - 2026-10-03
+
+### Añadido
+- Pruebas de integración del parser JPEG con JPEGs reales generados en tiempo de ejecución con Pillow del sistema (sin añadir dependencias al proyecto): baseline, progresivo (múltiples escaneos) y truncado sin EOI. Verifican extracción byte-exacta hasta el límite y evidencia `AMBIGUO`/`ESTIMADA` honesta. Se omiten (`skipTest`) si Pillow no está disponible.
+
+---
+
+## [1.6.3-alpha] - 2026-10-03
+
+### Corregido
+- **Parser JPEG incremental y conservador**: `_ParserJPEG` reemplaza la búsqueda ciega del primer `FF D9`. Interpreta SOI, EOI, SOS, segmentos con longitud de 2 bytes, datos de imagen tras SOS, byte stuffing (`FF 00`), marcadores de reinicio (`FF D0`-`FF D7`) y múltiples segmentos SOS (JPEG progresivo). Los `FF D9` dentro de segmentos delimitados por longitud y el stuffing ya no se tratan como fin de archivo.
+- Estructura inválida o longitudes contradictorias producen resultado `ESTIMADO` honesto con razón explícita; nunca éxito ni completitud.
+- Se conserva la extracción incremental con memoria acotada, el tope operativo de 100 MiB, AUD-005, creación exclusiva `"xb"`, limpieza parcial y contrato de evidencia.
+
+### Limitaciones conocidas
+- El parser interpreta la estructura de marcadores, pero no decodifica ni valida completamente la imagen; el resultado sigue siendo `AMBIGUO` ante un EOI plausible.
+
+---
+
+## [1.6.2-alpha] - 2026-10-03
+
+### Corregido
+- **Extracción JPEG con memoria acotada**: `_extraer_jpeg_stream` reemplaza a `_extraer_jpeg_exacto`. El payload ya no se acumula en un `bytearray` del tamaño del archivo: se lee en ventanas de 64 KiB y se escribe incrementalmente en el destino creado con `"xb"`, reteniendo 1 byte (carry) para detectar un `FF D9` partido entre lecturas.
+- Cancelación o error de E/S durante la escritura dejan evidencia `PARCIAL`/`FALLIDO` con `bytes_escritos=0` y eliminan la salida parcial; nunca se reporta éxito ni completitud.
+- Fuente vacía para JPEG ahora produce `FALLIDO` en lugar de éxito con 0 bytes.
+
+---
+
+## [1.6.1-alpha] - 2026-10-03
+
+### Corregido
+- **Límite JPEG de 8 MiB eliminado**: la extracción JPEG ahora usa el tope operativo global de 100 MiB (`EscaneoProfundo.TAMANO_MAX_ARCHIVO`), por lo que un JPEG legítimo de más de 8 MiB ya no se trunca automáticamente. El límite de 100 MiB sigue siendo operativo, explícito y se reporta en la evidencia cuando se alcanza.
+
+---
+
+## [1.6.0-alpha] - 2026-10-03
+
+### Añadido
+- **Contrato de evidencia de recuperación**: `ResultadoRecuperacion` y `EvidenciaRecuperacion` en `core/scanner.py`; cada `ArchivoEncontrado` ahora lleva `evidencia` con tamaño detectado, límite exacto, validación estructural (desconocida por defecto), bytes escritos, resultado y detalle.
+- Columna "Resultado" en la tabla de resultados y desglose por clasificación + bytes conservados en el diálogo de recuperación.
+- Cabecera de columna "Salud (tamaño)" para evitar confundir "salud" con integridad.
+
+### Corregido
+- **Límite JPEG**: `_extraer_jpeg_exacto` ya no puede exceder el máximo de 8 MiB al encontrar el marcador `FF D9` justo tras la ventana de lectura.
+- JPEG sin marcador EOI dentro del límite ahora se etiqueta explícitamente como estimación (`tamano_exacto=False`, resultado `Estimado`) y nunca como completo.
+
+### Limitaciones conocidas
+- No existe validador estructural real para ningún formato: el resultado "Completo estructuralmente" queda definido pero no se emite todavía.
+- El límite de 8 MiB por JPEG sigue siendo operativo y no representa el tamaño original.
+
+---
+
 ## [1.5.3-alpha] - 2026-09-29
 
 ### Corregido

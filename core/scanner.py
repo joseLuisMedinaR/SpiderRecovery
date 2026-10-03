@@ -26,6 +26,27 @@ class EstadoEscaneo(Enum):
     CANCELANDO = "cancelando"
 
 
+class ResultadoRecuperacion(Enum):
+    """Resultados posibles de una recuperación, con incertidumbre explícita."""
+    COMPLETO_ESTRUCTURAL = "Completo estructuralmente"
+    PARCIAL = "Parcial"
+    ESTIMADO = "Estimado"
+    AMBIGUO = "Ambiguo"
+    FALLIDO = "Fallido"
+
+
+@dataclass
+class EvidenciaRecuperacion:
+    """Evidencia asociada a una recuperación (contrato de resultados)."""
+    tamano_detectado: Optional[int] = None  # estimación del escaneo
+    limite_exacto: Optional[bool] = None
+    estructura_validada: Optional[bool] = None  # None = desconocido
+    bytes_escritos: int = 0
+    resultado: ResultadoRecuperacion = ResultadoRecuperacion.AMBIGUO
+    limite_alcanzado: Optional[str] = None  # marcador_fin|tamano_maximo|fin_fuente|cancelado|error
+    detalle: str = ""
+
+
 @dataclass
 class ArchivoEncontrado:
     """Representa un archivo encontrado durante el escaneo."""
@@ -39,6 +60,8 @@ class ArchivoEncontrado:
     salud: str = "Desconocida"  # Buena, Regular, Mala
     seleccionado: bool = False
     carpeta_original: str = ""  # Ruta de la carpeta original estimada
+    tamano_exacto: Optional[bool] = None  # True/False solo en extracción JPEG
+    evidencia: Optional[EvidenciaRecuperacion] = None
 
 
 @dataclass
@@ -243,7 +266,7 @@ class EscaneoProfundo:
     # Tamaño del bloque de lectura (64 KB para uso eficiente de RAM)
     TAMANO_BLOQUE = 64 * 1024
 
-    # Tamaño máximo de archivo a recuperar (100 MB)
+    # Límite operativo global de recursos (no es un tamaño de formato)
     TAMANO_MAX_ARCHIVO = 100 * 1024 * 1024
 
     def __init__(self):

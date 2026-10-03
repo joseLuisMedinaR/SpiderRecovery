@@ -325,7 +325,7 @@ class PantallaResultados(ctk.CTkFrame):
         frame_tree_container.grid_columnconfigure(0, weight=1)
 
         # Crear Treeview con columnas
-        columnas = ("seleccion", "nombre", "tipo", "tamano", "salud")
+        columnas = ("seleccion", "nombre", "tipo", "tamano", "salud", "resultado")
         self.tree_archivos = ttk.Treeview(
             frame_tree_container,
             columns=columnas,
@@ -339,13 +339,15 @@ class PantallaResultados(ctk.CTkFrame):
         self.tree_archivos.heading("nombre", text="Nombre del archivo", anchor="w")
         self.tree_archivos.heading("tipo", text="Tipo", anchor="w")
         self.tree_archivos.heading("tamano", text="Tamaño", anchor="e")
-        self.tree_archivos.heading("salud", text="Salud", anchor="center")
+        self.tree_archivos.heading("salud", text="Salud (tamaño)", anchor="center")
+        self.tree_archivos.heading("resultado", text="Resultado", anchor="center")
 
         self.tree_archivos.column("seleccion", width=40, minwidth=40, anchor="center", stretch=False)
         self.tree_archivos.column("nombre", width=250, minwidth=150, anchor="w")
         self.tree_archivos.column("tipo", width=100, minwidth=80, anchor="w")
         self.tree_archivos.column("tamano", width=80, minwidth=60, anchor="e", stretch=False)
-        self.tree_archivos.column("salud", width=80, minwidth=60, anchor="center", stretch=False)
+        self.tree_archivos.column("salud", width=100, minwidth=80, anchor="center", stretch=False)
+        self.tree_archivos.column("resultado", width=140, minwidth=100, anchor="center", stretch=False)
 
         # Scrollbar vertical
         scrollbar_y = ttk.Scrollbar(frame_tree_container, orient="vertical", command=self.tree_archivos.yview)
@@ -544,7 +546,7 @@ class PantallaResultados(ctk.CTkFrame):
                 "",
                 "end",
                 iid=str(id(archivo)),
-                values=(marca_seleccion, archivo.nombre, archivo.extension.upper(), tamano_str, f"{icono_salud} {archivo.salud}")
+                values=(marca_seleccion, archivo.nombre, archivo.extension.upper(), tamano_str, f"{icono_salud} {archivo.salud}", self._texto_resultado(archivo))
             )
 
         # Actualizar etiqueta de página
@@ -564,6 +566,12 @@ class PantallaResultados(ctk.CTkFrame):
             return f"{bytes_valor / (1024 ** 2):.1f} MB"
         else:
             return f"{bytes_valor / (1024 ** 3):.1f} GB"
+
+    def _texto_resultado(self, archivo: ArchivoEncontrado) -> str:
+        """Devuelve la etiqueta de resultado de recuperación para la tabla."""
+        if archivo.evidencia is None:
+            return "—"
+        return archivo.evidencia.resultado.value
 
     def _obtener_icono_salud(self, salud: str) -> str:
         """Obtiene el icono de salud correspondiente."""
@@ -646,7 +654,7 @@ class PantallaResultados(ctk.CTkFrame):
                 
                 self.tree_archivos.item(
                     item_id,
-                    values=(marca, archivo.nombre, archivo.extension.upper(), tamano_str, f"{icono_salud} {archivo.salud}")
+                    values=(marca, archivo.nombre, archivo.extension.upper(), tamano_str, f"{icono_salud} {archivo.salud}", self._texto_resultado(archivo))
                 )
                 
                 self._actualizar_info_seleccion()
@@ -991,13 +999,18 @@ class PantallaResultados(ctk.CTkFrame):
         recuperados, fallidos = self.recuperador.recuperar_archivos(archivos, destino)
 
         dialog.destroy()
-        self._mostrar_resultado_recuperacion(recuperados, fallidos, destino)
+        # Refrescar la tabla para mostrar la columna Resultado actualizada
+        try:
+            self._cargar_pagina_actual()
+        except Exception:
+            pass
+        self._mostrar_resultado_recuperacion(recuperados, fallidos, destino, archivos)
 
-    def _mostrar_resultado_recuperacion(self, recuperados: int, fallidos: int, destino: str):
+    def _mostrar_resultado_recuperacion(self, recuperados: int, fallidos: int, destino: str, archivos=None):
         """Muestra el resultado final de la recuperación."""
         dialog = ctk.CTkToplevel(self)
         dialog.title("Recuperación completada")
-        dialog.geometry("450x200")
+        dialog.geometry("500x280")
         dialog.transient(self)
         dialog.grab_set()
 
@@ -1021,10 +1034,25 @@ class PantallaResultados(ctk.CTkFrame):
         )
         label_titulo.pack()
 
+        # Desglose por resultado y bytes totales conservados
+        lineas = [f"Se recuperaron {recuperados} archivos",
+                  f"{f'({fallidos} fallidos) ' if fallidos > 0 else ''}en: {destino}"]
+        if archivos:
+            from core.scanner import ResultadoRecuperacion
+            conteo = {}
+            total_bytes = 0
+            for a in archivos:
+                if a.evidencia is not None:
+                    conteo[a.evidencia.resultado.value] = conteo.get(a.evidencia.resultado.value, 0) + 1
+                    total_bytes += a.evidencia.bytes_escritos
+            if conteo:
+                detalle = ", ".join(f"{k}: {v}" for k, v in sorted(conteo.items()))
+                lineas.append(f"Clasificación: {detalle}")
+                lineas.append(f"Bytes conservados: {total_bytes / (1024**2):.2f} MiB")
+
         label_info = ctk.CTkLabel(
             dialog,
-            text=f"Se recuperaron {recuperados} archivos\n"
-                 f"{f'({fallidos} fallidos) ' if fallidos > 0 else ''}en: {destino}",
+            text="\n".join(lineas),
             font=ctk.CTkFont(size=12),
             text_color="#CCCCCC",
             justify="center"

@@ -8,7 +8,266 @@ import platform
 from pathlib import Path
 from typing import Callable, Optional
 
-from core.scanner import ArchivoEncontrado, obtener_tamano_maximo, es_ruta_dispositivo_bloque
+from core.scanner import (
+    ArchivoEncontrado,
+    EscaneoProfundo,
+    EvidenciaRecuperacion,
+    ResultadoRecuperacion,
+    obtener_tamano_maximo,
+    es_ruta_dispositivo_bloque,
+)
+
+
+class _ParserPNG:
+    """
+    Parser estructural incremental y conservador de PNG.
+
+    Valida la firma de 8 bytes, el encuadre de chunks
+    (longitud de 4 bytes BE, tipo de 4 bytes, datos, CRC-32),
+    el orden IHDR primero, un único IEND de longitud 0, y la
+    CRC-32 estándar de cada chunk (zlib).
+
+    No decodifica píxeles. Un IEND estructuralmente plausible y
+    CRCs válidas son solo evidencia estructural, no prueba de
+    completitud del original.
+    """
+
+    _SIG = 0
+    _LEN = 1
+    _TIPO = 2
+    _DATA = 3
+    _CRC = 4
+    _FIN = 5
+
+    _FIRMA = b"\x89PNG\r\n\x1a\n"
+
+    def __init__(self):
+        self.estado = self._SIG
+        self.pos_sig = 0
+        self.len_buf = bytearray()
+        self.tipo_buf = bytearray()
+        self.crc_buf = bytearray()
+        self.restante_data = 0
+        self.crc_calculada = 0
+        self.chunks = 0
+        self.visto_ihdr = False
+        self.eoi = False  # IEND válido encontrado
+        self.invalido = False
+        self.razon = ""
+        self.crc_mala = False
+
+    def alimentar(self, data: bytes) -> int:
+        """Procesa un bloque; devuelve cuántos bytes consumió."""
+        import zlib
+        consumido = 0
+        for b in data:
+            if self.eoi or self.invalido:
+                break
+            consumido += 1
+            if self.estado == self._SIG:
+                if b != self._FIRMA[self.pos_sig]:
+                    self.invalido, self.razon = True, "Firma PNG incorrecta"
+                    break
+                self.pos_sig += 1
+                if self.pos_sig == 8:
+                    self.estado = self._LEN
+            elif self.estado == self._LEN:
+                self.len_buf.append(b)
+                if len(self.len_buf) == 4:
+                    longitud = int.from_bytes(self.len_buf, "big")
+                    if longitud & 0x80000000:
+                        self.invalido, self.razon = True, "Longitud con bit reservado"
+                        break
+                    self.restante_data = longitud
+                    self.len_buf.clear()
+                    self.estado = self._TIPO
+            elif self.estado == self._TIPO:
+                self.tipo_buf.append(b)
+                if len(self.tipo_buf) == 4:
+                    tipo = bytes(self.tipo_buf)
+                    if self.chunks == 0 and tipo != b"IHDR":
+                        self.invalido, self.razon = True, "El primer chunk no es IHDR"
+                        break
+                    if tipo == b"IHDR":
+                        if self.visto_ihdr:
+                            self.invalido, self.razon = True, "IHDR duplicado"
+                            break
+                        if self.restante_data != 13:
+                            self.invalido, self.razon = True, "IHDR con longitud distinta de 13"
+                            break
+                        self.visto_ihdr = True
+                    if tipo == b"IEND" and self.restante_data != 0:
+                        self.invalido, self.razon = True, "IEND con longitud distinta de 0"
+                        break
+                    self.crc_calculada = zlib.crc32(tipo) & 0xFFFFFFFF
+                    self.tipo_buf.clear()
+                    self.estado = self._DATA if self.restante_data > 0 else self._CRC
+            elif self.estado == self._DATA:
+                self.crc_calculada = zlib.crc32(bytes([b]), self.crc_calculada) & 0xFFFFFFFF
+                self.restante_data -= 1
+                if self.restante_data == 0:
+                    self.estado = self._CRC
+            elif self.estado == self._CRC:
+                self.crc_buf.append(b)
+                if len(self.crc_buf) == 4:
+                    declarada = int.from_bytes(self.crc_buf, "big")
+                    self.crc_buf.clear()
+                    if declarada != self.crc_calculada:
+                        self.crc_mala = True
+                        self.invalido, self.razon = True, "CRC de chunk inválida"
+                        break
+                    self.chunks += 1
+                    # IEND ya consumido: fin plausible
+                    if self.chunks > 0 and self.estado != self._FIN:
+                        pass
+                    # Detectar IEND por tipo (última tipo_buf ya limpia): usar flag
+                    self.estado = self._LEN
+                    # Marcar fin si este chunk fue IEND (se detecta abajo)
+                    # (tipo del chunk actual guardado en crc de tipo anterior)
+                    # Simpler: comprobar con el último tipo visto
+                    # (se almacena en _ultimo_tipo)
+                    # -> ver abajo
+                    self._ultimo_tipo_ok = getattr(self, "_ultimo_tipo", b"")
+                    if getattr(self, "_ultimo_tipo", b"") == b"IEND":
+                        self.eoi = True
+                        break
+            # Guardar el tipo actual para la detección de IEND
+            if self.estado == self._DATA or (self.estado == self._CRC and self.chunks == 0):
+                self._ultimo_tipo = bytes(self.tipo_buf) if self.tipo_buf else getattr(self, "_ultimo_tipo", b"")
+        return consumido
+
+
+class _ParserJPEG:
+    """
+    Parser estructural incremental y conservador de JPEG.
+
+    Solo determina si la secuencia de marcadores es plausible y dónde
+    terminaría el límite del archivo (EOI). No decodifica imagen.
+
+    Estados: ESPERA_SOI, ESPERA_FF, TIPO, LEN_HI, LEN_LO, CONTENIDO,
+    DATOS, DATOS_FF. El sub-estado `post_contenido` decide si tras un
+    segmento con longitud volvemos a ESPERA_FF (cabecera) o a DATOS
+    (tras un SOS dentro de datos de escaneo).
+    """
+
+    _ESPERA_SOI = 0
+    _ESPERA_FF = 1
+    _TIPO = 2
+    _LEN_HI = 3
+    _LEN_LO = 4
+    _CONTENIDO = 5
+    _DATOS = 6
+    _DATOS_FF = 7
+
+    def __init__(self):
+        self.estado = self._ESPERA_SOI
+        self.tipo = 0
+        self.post_contenido = self._ESPERA_FF
+        self.restante = 0
+        self.len_hi = 0
+        self.soi_visto = False
+        self.eoi = False
+        self.invalido = False
+        self.razon = ""
+
+    def _es_marcador_sin_longitud(self, t: int) -> bool:
+        return t in (0x01,) or 0xD0 <= t <= 0xD7
+
+    def alimentar(self, data: bytes) -> int:
+        """
+        Procesa el bloque y devuelve cuántos bytes consumió antes de
+        detenerse por EOI o estructura inválida. Todos los bytes
+        consumidos pertenecen al JPEG y pueden escribirse tal cual.
+        """
+        consumido = 0
+        for b in data:
+            if self.eoi or self.invalido:
+                break
+            consumido += 1
+            if self.estado == self._ESPERA_SOI:
+                if not self.soi_visto:
+                    if b != 0xFF:
+                        self.invalido, self.razon = True, "Se esperaba SOI (FF D8)"
+                        break
+                    self.soi_visto = True
+                else:
+                    if b != 0xD8:
+                        self.invalido, self.razon = True, "Se esperaba D8 tras FF"
+                        break
+                    self.estado = self._ESPERA_FF
+            elif self.estado == self._ESPERA_FF:
+                if b != 0xFF:
+                    self.invalido, self.razon = True, "Se esperaba 0xFF de marcador"
+                    break
+                self.estado = self._TIPO
+            elif self.estado == self._TIPO:
+                if b == 0xFF:
+                    # FF de relleno antes del tipo
+                    continue
+                t = b
+                if t == 0xD9:
+                    self.eoi = True
+                    break
+                if t == 0xD8:
+                    self.invalido, self.razon = True, "SOI duplicado inesperado"
+                    break
+                if self._es_marcador_sin_longitud(t):
+                    self.estado = self._ESPERA_FF
+                    continue
+                if t == 0xDA:
+                    self.tipo = t
+                    self.post_contenido = self._DATOS
+                else:
+                    self.tipo = t
+                    self.post_contenido = self._ESPERA_FF
+                self.estado = self._LEN_HI
+            elif self.estado == self._LEN_HI:
+                self.len_hi = b
+                self.estado = self._LEN_LO
+            elif self.estado == self._LEN_LO:
+                n = (self.len_hi << 8) | b
+                if n < 2:
+                    self.invalido, self.razon = True, f"Longitud de segmento inválida: {n}"
+                    break
+                self.restante = n - 2
+                if self.restante == 0:
+                    self.estado = self.post_contenido
+                else:
+                    self.estado = self._CONTENIDO
+            elif self.estado == self._CONTENIDO:
+                self.restante -= 1
+                if self.restante == 0:
+                    self.estado = self.post_contenido
+            elif self.estado == self._DATOS:
+                if b == 0xFF:
+                    self.estado = self._DATOS_FF
+            elif self.estado == self._DATOS_FF:
+                if b == 0x00:
+                    # Byte stuffing: dato, no marcador
+                    self.estado = self._DATOS
+                elif 0xD0 <= b <= 0xD7:
+                    # Marcador de reinicio
+                    self.estado = self._DATOS
+                elif b == 0xD9:
+                    self.eoi = True
+                    break
+                elif b == 0xDA:
+                    self.tipo = b
+                    self.post_contenido = self._DATOS
+                    self.estado = self._LEN_HI
+                elif b == 0xFF:
+                    # Relleno de FF repetidos
+                    continue
+                elif b == 0xD8:
+                    self.invalido, self.razon = True, "SOI dentro de datos de escaneo"
+                    break
+                else:
+                    # Otro marcador con longitud dentro de datos de escaneo:
+                    # se tolera; tras su contenido se reanudan datos
+                    self.tipo = b
+                    self.post_contenido = self._DATOS
+                    self.estado = self._LEN_HI
+        return consumido
 
 
 class RecuperadorArchivos:
@@ -78,14 +337,70 @@ class RecuperadorArchivos:
                 # AUD-005: validar dispositivo antes de extraer y de escribir
                 if not self._destino_distinto_del_origen(archivo, ruta_destino.parent):
                     print(f"[ERROR] Destino en el mismo dispositivo que el origen: {ruta_destino}")
+                    archivo.evidencia = EvidenciaRecuperacion(
+                        tamano_detectado=archivo.tamano,
+                        resultado=ResultadoRecuperacion.FALLIDO,
+                        detalle="Destino en el mismo dispositivo que el origen",
+                    )
                     fallidos += 1
                     continue
                 if ruta_destino.exists():
                     print(f"[ERROR] El archivo ya existe, no se sobrescribirá: {ruta_destino}")
+                    archivo.evidencia = EvidenciaRecuperacion(
+                        tamano_detectado=archivo.tamano,
+                        resultado=ResultadoRecuperacion.FALLIDO,
+                        detalle="El archivo ya existe en destino; no se sobrescribió",
+                    )
                     fallidos += 1
                     continue
 
                 # Extraer payload real desde el dispositivo
+                if archivo.extension.lower() == "jpg":
+                    # JPEG: extracción incremental con memoria acotada
+                    ruta_origen = self._extraer_ruta_dispositivo(archivo.ruta)
+                    if not ruta_origen:
+                        print(f"[ERROR] No se pudo determinar dispositivo para {archivo.nombre}")
+                        archivo.evidencia = EvidenciaRecuperacion(
+                            tamano_detectado=archivo.tamano,
+                            resultado=ResultadoRecuperacion.FALLIDO,
+                            detalle="No se pudo determinar la ruta de origen",
+                        )
+                        fallidos += 1
+                        continue
+                    try:
+                        resultado_jpeg = self._extraer_jpeg_stream(
+                            ruta_origen, archivo.offset, ruta_destino,
+                            EscaneoProfundo.TAMANO_MAX_ARCHIVO, archivo
+                        )
+                    except FileExistsError:
+                        print(f"[ERROR] El archivo apareció durante la recuperación, no se sobrescribirá: {ruta_destino}")
+                        archivo.evidencia = EvidenciaRecuperacion(
+                            tamano_detectado=archivo.tamano,
+                            resultado=ResultadoRecuperacion.FALLIDO,
+                            detalle="El archivo apareció durante la recuperación",
+                        )
+                        resultado_jpeg = None
+                    if resultado_jpeg is None:
+                        fallidos += 1
+                    elif resultado_jpeg[0] == 0:
+                        # Fuente vacía: considerar fallo sin reportar éxito
+                        try:
+                            if ruta_destino.exists():
+                                ruta_destino.unlink()
+                        except OSError:
+                            pass
+                        archivo.evidencia = EvidenciaRecuperacion(
+                            tamano_detectado=archivo.tamano,
+                            resultado=ResultadoRecuperacion.FALLIDO,
+                            detalle="La fuente no produjo bytes (vacía o ilegible)",
+                        )
+                        fallidos += 1
+                    else:
+                        recuperados += 1
+                        bytes_escritos, limite = resultado_jpeg
+                        archivo.evidencia = self._construir_evidencia(archivo, bytes_escritos, limite)
+                    continue
+
                 payload_extraido = self._extraer_payload(archivo)
 
                 if payload_extraido and len(payload_extraido) > 0:
@@ -95,8 +410,14 @@ class RecuperadorArchivos:
                         with open(ruta_destino, "xb") as f:
                             f.write(payload_extraido)
                         recuperados += 1
+                        archivo.evidencia = self._construir_evidencia(archivo, len(payload_extraido))
                     except FileExistsError:
                         print(f"[ERROR] El archivo apareció durante la recuperación, no se sobrescribirá: {ruta_destino}")
+                        archivo.evidencia = EvidenciaRecuperacion(
+                            tamano_detectado=archivo.tamano,
+                            resultado=ResultadoRecuperacion.FALLIDO,
+                            detalle="El archivo apareció durante la recuperación",
+                        )
                         fallidos += 1
                     except Exception as e:
                         # Solo se elimina el archivo que ESTA recuperación creó; nunca uno preexistente
@@ -106,9 +427,20 @@ class RecuperadorArchivos:
                         except OSError:
                             pass
                         print(f"[ERROR] Enviando payload a disco falló {archivo.nombre}: {e}")
+                        archivo.evidencia = EvidenciaRecuperacion(
+                            tamano_detectado=archivo.tamano,
+                            resultado=ResultadoRecuperacion.FALLIDO,
+                            bytes_escritos=0,
+                            detalle=f"Error de escritura: {e}",
+                        )
                         fallidos += 1
                 else:
                     print(f"[ADVERTENCIA] No se pudo extraer payload para {archivo.nombre}")
+                    archivo.evidencia = EvidenciaRecuperacion(
+                        tamano_detectado=archivo.tamano,
+                        resultado=ResultadoRecuperacion.FALLIDO,
+                        detalle="No se pudo extraer el payload",
+                    )
                     fallidos += 1
 
             except Exception as e:
@@ -116,6 +448,58 @@ class RecuperadorArchivos:
                 fallidos += 1
 
         return recuperados, fallidos
+
+    def _construir_evidencia(
+        self,
+        archivo: ArchivoEncontrado,
+        bytes_escritos: int,
+        limite_alcanzado: Optional[str] = None
+    ) -> EvidenciaRecuperacion:
+        """Construye la evidencia según el resultado de la extracción.
+
+        Nunca se afirma completitud por encontrar un marcador: COMPLETO_ESTRUCTURAL
+        exige validación estructural (hoy no existe para ningún formato).
+        """
+        if archivo.extension.lower() == "jpg" and archivo.tamano_exacto is False:
+            if limite_alcanzado == "estructura_invalida":
+                return EvidenciaRecuperacion(
+                    tamano_detectado=archivo.tamano,
+                    limite_exacto=False,
+                    estructura_validada=None,
+                    bytes_escritos=bytes_escritos,
+                    resultado=ResultadoRecuperacion.ESTIMADO,
+                    limite_alcanzado="estructura_invalida",
+                    detalle="Estructura JPEG inválida o insuficiente; límite no demostrado",
+                )
+            return EvidenciaRecuperacion(
+                tamano_detectado=archivo.tamano,
+                limite_exacto=False,
+                estructura_validada=None,
+                bytes_escritos=bytes_escritos,
+                resultado=ResultadoRecuperacion.ESTIMADO,
+                limite_alcanzado=limite_alcanzado or "fin_fuente",
+                detalle="JPEG sin marcador EOI dentro del límite de recursos de 100 MiB",
+            )
+        if archivo.extension.lower() == "jpg" and archivo.tamano_exacto is True:
+            return EvidenciaRecuperacion(
+                tamano_detectado=archivo.tamano,
+                limite_exacto=True,
+                estructura_validada=None,  # sin validador JPEG implementado
+                bytes_escritos=bytes_escritos,
+                resultado=ResultadoRecuperacion.AMBIGUO,
+                limite_alcanzado=limite_alcanzado or "marcador_fin",
+                detalle="Límite por EOI tras estructura plausibles interpretada parcialmente (sin decodificar la imagen)",
+            )
+        # Formatos sin validación estructural implementada: siempre estimado
+        return EvidenciaRecuperacion(
+            tamano_detectado=archivo.tamano,
+            limite_exacto=None,
+            estructura_validada=None,
+            bytes_escritos=bytes_escritos,
+            resultado=ResultadoRecuperacion.ESTIMADO,
+            limite_alcanzado="fin_fuente_o_maximo",
+            detalle="Sin validador estructural para este formato; tamaño acotado por máximo",
+        )
 
     def _extraer_payload(self, archivo: ArchivoEncontrado) -> Optional[bytes]:
         """
@@ -129,7 +513,7 @@ class RecuperadorArchivos:
         """
         # Obtener tamaño máximo según tipo de archivo
         tamano_maximo = obtener_tamano_maximo(archivo.extension)
-        
+
         # Extraer la ruta del dispositivo desde la ruta del archivo
         # Formato esperado: "/dev/sdX#offset=12345" o "\\\\.\\D:#offset=12345"
         ruta_dispositivo = self._extraer_ruta_dispositivo(archivo.ruta)
@@ -253,6 +637,88 @@ class RecuperadorArchivos:
             return letra_origen != letra_destino
         except Exception:
             return False
+
+    def _extraer_jpeg_stream(
+        self,
+        ruta_origen: str,
+        offset: int,
+        ruta_destino: Path,
+        tamano_maximo: int,
+        archivo: ArchivoEncontrado
+    ) -> Optional[tuple[int, str]]:
+        """
+        Extrae un JPEG escribiendo incrementalmente en el destino exclusivo.
+
+        - Ventana de lectura de 64 KiB; parser incremental byte a byte.
+        - Nunca escribe más allá del primer EOI estructuralmente plausible ni
+          del `tamano_maximo` de recursos (100 MiB).
+        - Memoria acotada: solo la ventana de lectura.
+
+        Returns:
+            (bytes_escritos, limite_alcanzado) o None si falló/canceló.
+        """
+        ventana = 64 * 1024
+        parser = _ParserJPEG()
+        retenido = 0
+        leido = 0
+
+        def _limpiar_parcial():
+            try:
+                if ruta_destino.exists():
+                    ruta_destino.unlink()
+            except OSError:
+                pass
+
+        try:
+            with open(ruta_origen, "rb") as src, open(ruta_destino, "xb") as dst:
+                src.seek(offset)
+                while leido < tamano_maximo:
+                    if self._cancelar:
+                        _limpiar_parcial()
+                        archivo.evidencia = EvidenciaRecuperacion(
+                            tamano_detectado=archivo.tamano,
+                            resultado=ResultadoRecuperacion.PARCIAL,
+                            bytes_escritos=0,
+                            detalle="Cancelado durante la escritura; salida parcial eliminada",
+                            limite_alcanzado="cancelado",
+                        )
+                        return None
+                    bloque = src.read(min(ventana, tamano_maximo - leido))
+                    if not bloque:
+                        break
+                    leido += len(bloque)
+                    consumido = parser.alimentar(bloque)
+                    if consumido > 0:
+                        dst.write(bloque[:consumido])
+                        retenido += consumido
+                    if parser.eoi:
+                        archivo.tamano_exacto = True
+                        return retenido, "marcador_fin"
+                    if parser.invalido:
+                        archivo.tamano_exacto = False
+                        print(f"[ADVERTENCIA] Estructura JPEG no interpretable: {parser.razon}")
+                        return retenido, "estructura_invalida"
+                archivo.tamano_exacto = False
+                limite = "tamano_maximo" if leido >= tamano_maximo else "fin_fuente"
+                return retenido, limite
+        except FileExistsError:
+            archivo.evidencia = EvidenciaRecuperacion(
+                tamano_detectado=archivo.tamano,
+                resultado=ResultadoRecuperacion.FALLIDO,
+                detalle="El archivo ya existía en destino",
+            )
+            raise
+        except Exception as e:
+            _limpiar_parcial()
+            archivo.evidencia = EvidenciaRecuperacion(
+                tamano_detectado=archivo.tamano,
+                resultado=ResultadoRecuperacion.FALLIDO,
+                bytes_escritos=0,
+                detalle=f"Error de E/S: {e}",
+                limite_alcanzado="error",
+            )
+            print(f"[ERROR] Extrayendo JPEG de {archivo.nombre}: {e}")
+            return None
 
     def _extraer_desde_dispositivo(
         self,
