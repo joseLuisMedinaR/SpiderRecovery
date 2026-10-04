@@ -24,16 +24,20 @@ class _ParserPNG:
 
     Valida la firma de 8 bytes, el encuadre de chunks
     (longitud de 4 bytes BE, tipo de 4 bytes, datos, CRC-32),
-    el orden IHDR primero, al menos un IDAT, un IEND de longitud 0
-    como último chunk, y la CRC-32 estándar de cada chunk (zlib).
+    el orden IHDR primero, la semántica de los campos del IHDR,
+    la consecutividad de los IDAT, al menos un IDAT, un IEND de
+    longitud 0 como último chunk, y la CRC-32 estándar de cada chunk
+    (zlib).
 
     La memoria es acotada: nunca se reserva memoria proporcional a la
     longitud declarada por un chunk. Los datos se recorren en rodajas
     del bloque de entrada, de modo que una longitud enorme o maliciosa
-    no provoca asignaciones grandes.
+    no provoca asignaciones grandes. Solo se retiene el IHDR (13 bytes
+    fijos) para validar su semántica.
 
-    No decodifica píxeles. Un IEND con todas las CRC válidas es
-    evidencia estructural, no prueba de integridad del original.
+    No decodifica píxeles ni descomprime zlib. Un IEND con todas las
+    CRC válidas es evidencia estructural, no prueba de integridad del
+    original.
     """
 
     _SIG = 0
@@ -47,6 +51,17 @@ class _ParserPNG:
     # Límite de longitud permitido por el estándar PNG (bit superior 0).
     _LEN_MAXIMA = 0x7FFFFFFF
 
+    # Profundidades de bits válidas por tipo de color (PNG 2ª ed., tabla 11.1).
+    #   0 = escala de grises, 2 = color verdadero, 3 = indexado,
+    #   4 = grises con alfa, 6 = color verdadero con alfa.
+    _PROFUNDIDADES_POR_COLOR = {
+        0: (1, 2, 4, 8, 16),
+        2: (8, 16),
+        3: (1, 2, 4, 8),
+        4: (8, 16),
+        6: (8, 16),
+    }
+
     def __init__(self):
         self.estado = self._SIG
         self.pos_sig = 0
@@ -59,6 +74,9 @@ class _ParserPNG:
         self.chunks = 0
         self.visto_ihdr = False
         self.visto_idat = False
+        self.idat_terminado = False  # ya apareció un chunk no-IDAT tras IDAT
+        self.ihdr_buf = bytearray()  # 13 bytes fijos del payload IHDR
+        self.ihdr_validado = False
         self.eoi = False  # IEND válido encontrado
         self.invalido = False
         self.razon = ""
@@ -79,8 +97,55 @@ class _ParserPNG:
             return False
         return True
 
+    def _validar_ihdr(self) -> bool:
+        """Valida la semántica de los 13 bytes del payload IHDR.
+
+        No decodifica píxeles. Comprueba ancho/alto distintos de cero,
+        tipo de color permitido, profundidad de bits compatible con el
+        tipo de color, y métodos de compresión, filtro y entrelazado
+        dentro de los valores permitidos por el estándar.
+        """
+        datos = bytes(self.ihdr_buf)
+        self.ihdr_buf.clear()
+        if len(datos) != 13:
+            self._invalidar("IHDR con longitud distinta de 13")
+            return False
+        ancho, alto = int.from_bytes(datos[0:4], "big"), int.from_bytes(datos[4:8], "big")
+        profundidad, tipo_color, compresion, filtro, entrelazado = datos[8:13]
+        if ancho == 0 or alto == 0:
+            self._invalidar("IHDR con ancho o alto igual a cero")
+            return False
+        if tipo_color not in self._PROFUNDIDADES_POR_COLOR:
+            self._invalidar(f"Tipo de color PNG no permitido: {tipo_color}")
+            return False
+        if profundidad not in self._PROFUNDIDADES_POR_COLOR[tipo_color]:
+            self._invalidar(
+                f"Profundidad de bits {profundidad} no válida para el tipo de color {tipo_color}"
+            )
+            return False
+        if compresion != 0:
+            self._invalidar(f"Método de compresión PNG no permitido: {compresion}")
+            return False
+        if filtro != 0:
+            self._invalidar(f"Método de filtro PNG no permitido: {filtro}")
+            return False
+        if entrelazado not in (0, 1):
+            self._invalidar(f"Método de entrelazado PNG no permitido: {entrelazado}")
+            return False
+        self.ihdr_validado = True
+        return True
+
     def _validar_orden(self, tipo: bytes) -> bool:
-        """Comprueba la posición del chunk dentro de la secuencia PNG."""
+        """Comprueba la posición del chunk dentro de la secuencia PNG.
+
+        Reglas aplicadas:
+        - El primer chunk debe ser IHDR (uno solo).
+        - Los IDAT deben ser consecutivos: una vez que aparece un chunk
+          no-IDAT tras el primer IDAT, ningún IDAT posterior es válido.
+        - IEND exige al menos un IDAT previo y longitud 0.
+        - Los chunks auxiliares (p. ej. PLTE, tRNS, gAMA) se aceptan en
+          cualquier posición válida sin rechazar PNG legítimos.
+        """
         if self.chunks == 0 and tipo != b"IHDR":
             self._invalidar("El primer chunk no es IHDR")
             return False
@@ -96,6 +161,9 @@ class _ParserPNG:
             if not self.visto_ihdr:
                 self._invalidar("IDAT antes de IHDR")
                 return False
+            if self.idat_terminado:
+                self._invalidar("IDAT no consecutivo: apareció tras un chunk no-IDAT")
+                return False
             self.visto_idat = True
         elif tipo == b"IEND":
             if not self.visto_ihdr:
@@ -107,9 +175,18 @@ class _ParserPNG:
             if self.restante_data != 0:
                 self._invalidar("IEND con longitud distinta de 0")
                 return False
+        else:
+            # Chunk auxiliar (o desconocido): tras el primer IDAT cierra la
+            # secuencia de IDAT. No se rechaza por sí mismo.
+            if self.visto_idat:
+                self.idat_terminado = True
         return True
 
     def _chunk_completado(self):
+        # El IHDR se valida semánticamente una vez leídos sus 13 bytes y
+        # verificada su CRC. Si es inválido, no se cuenta como chunk válido.
+        if self.tipo_actual == b"IHDR" and not self._validar_ihdr():
+            return
         self.chunks += 1
         if self.tipo_actual == b"IEND":
             self.eoi = True
@@ -167,6 +244,10 @@ class _ParserPNG:
                     self.estado = self._CRC if self.restante_data == 0 else self._DATA
             elif estado == self._DATA:
                 tomar = min(self.restante_data, n - i)
+                if self.tipo_actual == b"IHDR" and len(self.ihdr_buf) < 13:
+                    # Solo el IHDR se retiene (13 bytes fijos) para validar
+                    # su semántica; nunca según longitudes no confiables.
+                    self.ihdr_buf += data[i:i + min(tomar, 13 - len(self.ihdr_buf))]
                 self.crc_calculada = zlib.crc32(
                     data[i:i + tomar], self.crc_calculada
                 ) & 0xFFFFFFFF
