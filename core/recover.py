@@ -778,6 +778,200 @@ class _ParserGIF:
         return i
 
 
+class _ParserTIFF:
+    """
+    Parser estructural de TIFF clásico (no BigTIFF), de ambos órdenes de
+    byte (II little-endian, MM big-endian, mágico 42).
+
+    Valida la cabecera (orden de bytes, mágico, offset de IFD0), recorre la
+    cadena de IFDs (con detección de ciclos y límite de longitud), y valida
+    cada entrada de IFD: tipo soportado, contaje, posible desbordamiento de
+    contaje*tamaño_tipo, y que las áreas de valor externas caigan dentro de
+    la ventana analizada. También inspecciona las etiquetas de strips
+    (273/279) y tiles (324/325) y valida que sus arrays de offsets y
+    tamaños sean coherentes entre sí y que los rangos referenciados queden
+    dentro de la fuente cuando ésta tiene tamaño conocido.
+
+    La memoria es acotada: nunca se reserva memoria según contajes o
+    dimensiones declarados por el archivo; los arrays se recorren contando
+    y validando contra la longitud real de la ventana.
+
+    IMPORTANTE (honestidad forense): este parser NUNCA afirma que un
+    boundary sea exacto. Un TIFF puede tener datos no referenciados tras
+    el último rango referenciado (metadatos, IFDs auxiliares, alineación).
+    El máximo extremo referenciado se etiqueta como estimado.
+    """
+
+    _TAMANOS_TIPO = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1,
+                    7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8}
+    _MAX_ENTRADAS = 1024
+    _MAX_IFDS = 64
+    _TAG_STRIP_OFFS = 273
+    _TAG_STRIP_BYTES = 279
+    _TAG_TILE_OFFS = 324
+    _TAG_TILE_BYTES = 325
+
+    def __init__(self):
+        self.ok = False
+        self.razon = ""
+        self.extent = 0
+        self.validada = False
+        self.respaldo = 0  # prefijo consumido antes de un fallo
+
+    def _invalidar(self, razon: str, respaldo: int = 0):
+        self.ok = False
+        self.razon = razon
+        self.respaldo = respaldo
+
+    def analizar(self, ventana: bytes, disponible: Optional[int]) -> bool:
+        m = len(ventana)
+        if m < 8:
+            self._invalidar("Cabecera TIFF incompleta")
+            return False
+        orden = ventana[0:2]
+        if orden == b"II":
+            endian = "little"
+        elif orden == b"MM":
+            endian = "big"
+        else:
+            self._invalidar("Marcador de orden de bytes no válido")
+            return False
+        magico = int.from_bytes(ventana[2:4], endian)
+        if magico == 43:
+            self._invalidar("BigTIFF (mágico 43) no soportado", 4)
+            return False
+        if magico != 42:
+            self._invalidar("Número mágico TIFF inválido", 4)
+            return False
+        self.respaldo = 8
+
+        u32 = lambda off: int.from_bytes(ventana[off:off + 4], endian)
+        u16 = lambda off: int.from_bytes(ventana[off:off + 2], endian)
+
+        ifd0 = u32(4)
+        if ifd0 == 0 or ifd0 < 8 or ifd0 >= m:
+            self._invalidar("Offset de IFD0 fuera de rango", 8)
+            return False
+
+        visto = set()
+        offset = ifd0
+        extent = 8
+        strips_offs = None
+        strips_bytes = None
+        tiles_offs = None
+        tiles_bytes = None
+
+        while offset != 0:
+            if offset in visto:
+                self._invalidar("Cadena de IFDs cíclica", offset)
+                return False
+            if len(visto) >= self._MAX_IFDS:
+                self._invalidar("Cadena de IFDs demasiado larga")
+                return False
+            visto.add(offset)
+            if offset < 0 or offset + 2 > m:
+                self._invalidar("IFD fuera de rango")
+                return False
+            n = u16(offset)
+            if n > self._MAX_ENTRADAS:
+                self._invalidar(f"Número excesivo de entradas de IFD: {n}", offset)
+                return False
+            fin_ifd = offset + 2 + n * 12 + 4
+            if fin_ifd > m:
+                self._invalidar("IFD truncado", offset)
+                return False
+            extent = max(extent, fin_ifd)
+
+            for k in range(n):
+                base = offset + 2 + k * 12
+                tag = u16(base)
+                tipo = u16(base + 2)
+                cuenta = u32(base + 4)
+                if tipo == 0 or tipo > 12 or tipo not in self._TAMANOS_TIPO:
+                    self._invalidar(f"Tipo de entrada no soportado: {tipo}", base)
+                    return False
+                if cuenta == 0:
+                    self._invalidar("Cuenta de entrada a cero", base)
+                    return False
+                tam = cuenta * self._TAMANOS_TIPO[tipo]
+                if tam > m:
+                    # El área no cabe en la ventana: ni siquiera se puede
+                    # localizar con seguridad; no asignar nada según cuenta.
+                    self._invalidar("Área de valor fuera de rango", base)
+                    return False
+                if tam <= 4:
+                    valor = ventana[base + 8:base + 8 + tam]
+                else:
+                    voff = u32(base + 8)
+                    if voff < 8 or voff + tam > m:
+                        self._invalidar("Área de valor referenciada fuera de rango", base)
+                        return False
+                    valor = ventana[voff:voff + tam]
+                    extent = max(extent, voff + tam)
+
+                def _array_u32(buf, tipo):
+                    # offsets/counts suelen ser SHORT o LONG; aceptamos ambos.
+                    paso = 4 if tipo == 4 else 2
+                    if len(buf) % paso != 0:
+                        self._invalidar("Array de offsets/tamaños desalineado", base)
+                        return None
+                    return [int.from_bytes(buf[i:i + paso], endian)
+                            for i in range(0, len(buf), paso)]
+
+                if tag == self._TAG_STRIP_OFFS:
+                    strips_offs = _array_u32(valor, tipo)
+                    if strips_offs is None:
+                        return False
+                elif tag == self._TAG_STRIP_BYTES:
+                    strips_bytes = _array_u32(valor, tipo)
+                    if strips_bytes is None:
+                        return False
+                elif tag == self._TAG_TILE_OFFS:
+                    tiles_offs = _array_u32(valor, tipo)
+                    if tiles_offs is None:
+                        return False
+                elif tag == self._TAG_TILE_BYTES:
+                    tiles_bytes = _array_u32(valor, tipo)
+                    if tiles_bytes is None:
+                        return False
+
+            offset = u32(fin_ifd - 4)
+
+        def _revisar_rangos(offs, counts, etiqueta):
+            nonlocal extent
+            if (offs is None) != (counts is None):
+                self._invalidar(f"{etiqueta} incompletos", m)
+                return False
+            if offs is not None:
+                if len(offs) != len(counts):
+                    self._invalidar(f"{etiqueta}: longitud de arrays incoherente", m)
+                    return False
+                for o, c in zip(offs, counts):
+                    if o == 0:
+                        self._invalidar(f"{etiqueta}: offset nulo", m)
+                        return False
+                    fin = o + c
+                    if fin < o:
+                        self._invalidar(f"{etiqueta}: desbordamiento", m)
+                        return False
+                    if disponible is not None and fin > disponible:
+                        self._invalidar(f"{etiqueta}: rango fuera de la fuente", m)
+                        return False
+                    extent = max(extent, fin)
+            return True
+
+        if not _revisar_rangos(strips_offs, strips_bytes, "Strips"):
+            return False
+        if not _revisar_rangos(tiles_offs, tiles_bytes, "Tiles"):
+            return False
+
+        self.ok = True
+        self.validada = True
+        self.extent = extent
+        self.respaldo = extent if extent <= m else m
+        return True
+
+
 class RecuperadorArchivos:
     """
     Gestiona la recuperación de archivos seleccionados.
@@ -864,7 +1058,7 @@ class RecuperadorArchivos:
 
                 # Extraer payload real desde el dispositivo
                 extension_actual = archivo.extension.lower()
-                if extension_actual in ("jpg", "png", "bmp", "gif"):
+                if extension_actual in ("jpg", "png", "bmp", "gif", "tiff"):
                     # JPEG/PNG/BMP: extracción incremental con memoria acotada
                     ruta_origen = self._extraer_ruta_dispositivo(archivo.ruta)
                     if not ruta_origen:
@@ -881,6 +1075,7 @@ class RecuperadorArchivos:
                         "png": self._extraer_png_stream,
                         "bmp": self._extraer_bmp_stream,
                         "gif": self._extraer_gif_stream,
+                        "tiff": self._extraer_tiff_stream,
                     }
                     extractor = extractores[extension_actual]
                     try:
@@ -1012,6 +1207,8 @@ class RecuperadorArchivos:
             return self._construir_evidencia_bmp(archivo, bytes_escritos, limite_alcanzado)
         if archivo.extension.lower() == "gif":
             return self._construir_evidencia_gif(archivo, bytes_escritos, limite_alcanzado)
+        if archivo.extension.lower() == "tiff":
+            return self._construir_evidencia_tiff(archivo, bytes_escritos, limite_alcanzado)
         # Formatos sin validación estructural implementada: siempre estimado
         return EvidenciaRecuperacion(
             tamano_detectado=archivo.tamano,
@@ -1136,6 +1333,46 @@ class RecuperadorArchivos:
             tamano_detectado=archivo.tamano,
             limite_exacto=False,
             estructura_validada=None,
+            bytes_escritos=bytes_escritos,
+            resultado=ResultadoRecuperacion.ESTIMADO,
+            limite_alcanzado=limite_alcanzado or "fin_fuente",
+            detalle=detalle,
+        )
+
+    def _construir_evidencia_tiff(
+        self,
+        archivo: ArchivoEncontrado,
+        bytes_escritos: int,
+        limite_alcanzado: Optional[str]
+    ) -> EvidenciaRecuperacion:
+        """
+        Evidencia honesta para TIFF clásico.
+
+        Una cabecera válida y una cadena de IFDs coherentes con los arrays
+        de strips/tiles validados NO demuestran que el límite sea el
+        original (pueden existir datos no referenciados, metadatos o IFDs
+        auxiliares más allá del último rango referenciado). Por eso el
+        boundary nunca es exacto: el resultado es siempre ESTIMADO.
+        """
+        if archivo.tamano_exacto is False and limite_alcanzado == "estructura_invalida":
+            return EvidenciaRecuperacion(
+                tamano_detectado=archivo.tamano,
+                limite_exacto=False,
+                estructura_validada=None,
+                bytes_escritos=bytes_escritos,
+                resultado=ResultadoRecuperacion.ESTIMADO,
+                limite_alcanzado="estructura_invalida",
+                detalle="Estructura TIFF inválida, BigTIFF no soportado o fuera de rango; límite no demostrado",
+            )
+        detalle = (
+            "Cabecera y estructura IFD/strips coherentes; el límite usado es el máximo extremo referenciado, NO un límite exacto (pueden existir datos no referenciados tras él). No se decodificaron píxeles: la integridad del contenido no está verificada."
+            if limite_alcanzado == "extent_referenciado"
+            else "La fuente terminó antes del límite referenciado o el tope operativo cortó antes; límite no demostrado. No se decodificaron píxeles."
+        )
+        return EvidenciaRecuperacion(
+            tamano_detectado=archivo.tamano,
+            limite_exacto=False,
+            estructura_validada=True,
             bytes_escritos=bytes_escritos,
             resultado=ResultadoRecuperacion.ESTIMADO,
             limite_alcanzado=limite_alcanzado or "fin_fuente",
@@ -1619,6 +1856,130 @@ class RecuperadorArchivos:
                 limite_alcanzado="error",
             )
             print(f"[ERROR] Extrayendo GIF de {archivo.nombre}: {e}")
+            return None
+
+    def _extraer_tiff_stream(
+        self,
+        ruta_origen: str,
+        offset: int,
+        ruta_destino: Path,
+        tamano_maximo: int,
+        archivo: ArchivoEncontrado
+    ) -> Optional[tuple[int, str]]:
+        """
+        Extrae un TIFF clásico escribiendo incrementalmente en el destino.
+
+        - Primera ventana acotada (1 MiB) para validar cabecera, cadena de
+          IFDs y arrays de strips/tiles. Nunca se carga toda la fuente.
+        - Con estructura válida, copia los bytes [0, extent) donde extent
+          es el máximo extremo referenciado, acotado por el tope operativo.
+        - Nunca afirma que el boundary sea exacto: el límite queda
+          etiquetado como "extent_referenciado" (estimado).
+        - Con estructura inválida, escribe solo el prefijo validado y
+          etiqueta "estructura_invalida".
+
+        Returns:
+            (bytes_escritos, limite_alcanzado) o None si falló/canceló.
+        """
+        ventana_meta = 1 * 1024 * 1024
+        chunk = 64 * 1024
+        parser = _ParserTIFF()
+        escrito = 0
+
+        def _limpiar_parcial():
+            try:
+                if ruta_destino.exists():
+                    ruta_destino.unlink()
+            except OSError:
+                pass
+
+        try:
+            with open(ruta_origen, "rb") as src, open(ruta_destino, "xb") as dst:
+                src.seek(offset)
+                try:
+                    est = os.stat(ruta_origen).st_size
+                    disponible = est - offset if est > 0 else None
+                    if disponible is not None and disponible < 0:
+                        disponible = 0
+                except OSError:
+                    disponible = None
+                ventana_meta = min(ventana_meta, tamano_maximo)
+                buffer = bytearray()
+                while len(buffer) < ventana_meta:
+                    bloque = src.read(min(chunk, ventana_meta - len(buffer)))
+                    if not bloque:
+                        break
+                    buffer += bloque
+                ventana = bytes(buffer)
+                if self._cancelar:
+                    raise InterruptedError()
+                parser.analizar(ventana, disponible)
+
+                if not parser.ok:
+                    archivo.tamano_exacto = False
+                    print(f"[ADVERTENCIA] Estructura TIFF no interpretable: {parser.razon}")
+                    prefijo = ventana[:parser.respaldo]
+                    dst.write(prefijo)
+                    return len(prefijo), "estructura_invalida"
+
+                # Estructura válida: copiar [0, extent) con streaming.
+                limite = min(parser.extent, tamano_maximo)
+                escritos_total = 0
+                datos = ventana
+                pos = 0
+                while pos < limite:
+                    if self._cancelar:
+                        _limpiar_parcial()
+                        archivo.evidencia = EvidenciaRecuperacion(
+                            tamano_detectado=archivo.tamano,
+                            resultado=ResultadoRecuperacion.PARCIAL,
+                            bytes_escritos=0,
+                            detalle="Cancelado durante la escritura; salida parcial eliminada",
+                            limite_alcanzado="cancelado",
+                        )
+                        return None
+                    toma = min(len(datos), limite - pos)
+                    dst.write(datos[:toma])
+                    escritos_total += toma
+                    pos += toma
+                    if pos >= limite:
+                        break
+                    datos = src.read(min(chunk, limite - pos))
+                    if not datos:
+                        break
+                archivo.tamano_exacto = False
+                if escritos_total >= parser.extent and parser.extent <= tamano_maximo:
+                    return escritos_total, "extent_referenciado"
+                if escritos_total >= tamano_maximo:
+                    return escritos_total, "tamano_maximo"
+                return escritos_total, "fin_fuente"
+        except InterruptedError:
+            _limpiar_parcial()
+            archivo.evidencia = EvidenciaRecuperacion(
+                tamano_detectado=archivo.tamano,
+                resultado=ResultadoRecuperacion.PARCIAL,
+                bytes_escritos=0,
+                detalle="Cancelado durante la escritura; salida parcial eliminada",
+                limite_alcanzado="cancelado",
+            )
+            return None
+        except FileExistsError:
+            archivo.evidencia = EvidenciaRecuperacion(
+                tamano_detectado=archivo.tamano,
+                resultado=ResultadoRecuperacion.FALLIDO,
+                detalle="El archivo ya existía en destino",
+            )
+            raise
+        except Exception as e:
+            _limpiar_parcial()
+            archivo.evidencia = EvidenciaRecuperacion(
+                tamano_detectado=archivo.tamano,
+                resultado=ResultadoRecuperacion.FALLIDO,
+                bytes_escritos=0,
+                detalle=f"Error de E/S: {e}",
+                limite_alcanzado="error",
+            )
+            print(f"[ERROR] Extrayendo TIFF de {archivo.nombre}: {e}")
             return None
 
     def _extraer_desde_dispositivo(

@@ -86,6 +86,8 @@ FIRMAS_CARVING = [
     (b"GIF87a", b"\x00\x3b", "gif", "Imágenes", "Imagen GIF"),
     (b"GIF89a", b"\x00\x3b", "gif", "Imágenes", "Imagen GIF"),
     (b"BM", None, "bmp", "Imágenes", "Imagen BMP"),
+    (b"II*\x00", None, "tiff", "Imágenes", "Imagen TIFF"),
+    (b"MM\x00*", None, "tiff", "Imágenes", "Imagen TIFF"),
 
     # Documentos
     (b"%PDF-", b"%%EOF", "pdf", "Documentos", "Documento PDF"),
@@ -115,6 +117,7 @@ TAMANOS_MAXIMOS_CARVING = {
     "png": 8 * 1024 * 1024,      # 8 MB
     "gif": 8 * 1024 * 1024,      # 8 MB
     "bmp": 8 * 1024 * 1024,      # 8 MB
+    "tiff": 8 * 1024 * 1024,     # 8 MB
     
     # Documentos: 15 MB máximo
     "pdf": 15 * 1024 * 1024,     # 15 MB
