@@ -270,6 +270,155 @@ class _ParserPNG:
         return i
 
 
+class _ParserBMP:
+    """
+    Parser estructural incremental y conservador de BMP de Windows.
+
+    Valida la firma "BM", el tamaño de la cabecera DIB (variantes
+    BITMAPINFOHEADER y sus extensiones V2/V3/V4/V5), las dimensiones
+    (ancho positivo, alto distinto de cero, incluido el caso top-down
+    con alto negativo), los planos, la profundidad de bits, la
+    compresión (solo BI_RGB sin comprimir), el desplazamiento a los
+    datos de píxel, el tamaño declarado del archivo, el tamaño de
+    imagen declarado y el tamaño calculado con filas alineadas a 4 bytes.
+
+    La memoria es acotada: solo se retienen los bytes de la cabecera
+    (<= 138 bytes) para validarlos; los datos de píxel no se acumulan.
+    El límite se deriva aritméticamente de los campos validados; nunca
+    se reserva memoria según tamaños no confiables.
+
+    No decodifica los píxeles. Un límite y una cabecera coherentes son
+    evidencia estructural, no prueba de integridad del original.
+    """
+
+    _CAB = 0
+    _DATOS = 1
+
+    _FIRMA = b"BM"
+    # Variantes de cabecera DIB de Windows soportadas: todas comparten los
+    # primeros 40 bytes con BITMAPINFOHEADER.
+    _DIB_SOPORTADOS = (40, 52, 56, 108, 124)
+    _BPP_SOPORTADOS = (1, 4, 8, 16, 24, 32)
+    _COMPRESION_SOPORTADA = 0  # BI_RGB (sin comprimir)
+    # Mínimo para leer firma (2) + cabecera de archivo (12) + tamaño DIB (4).
+    _MIN_CABECERA = 18
+
+    def __init__(self):
+        self.estado = self._CAB
+        self.buf = bytearray()
+        self._cabecera_objetivo = self._MIN_CABECERA
+        self._dib_leido = False
+        self.dib_size = 0
+        self.tamano_total = 0
+        self.restante_datos = 0
+        self.fin = False
+        self.invalido = False
+        self.razon = ""
+
+    def _invalidar(self, razon: str):
+        self.invalido = True
+        self.razon = razon
+
+    def _procesar_cabecera(self) -> bool:
+        """Primera fase: lee el tamaño DIB. Segunda: valida los campos."""
+        b = bytes(self.buf)
+        if not self._dib_leido:
+            if b[0:2] != self._FIRMA:
+                self._invalidar("Firma BMP incorrecta")
+                return False
+            dib = int.from_bytes(b[14:18], "little")
+            if dib not in self._DIB_SOPORTADOS:
+                self._invalidar(f"Tamaño de cabecera DIB no soportado: {dib}")
+                return False
+            self.dib_size = dib
+            self._dib_leido = True
+            self._cabecera_objetivo = 14 + dib
+            return True
+        return self._validar_campos(b)
+
+    def _validar_campos(self, b: bytes) -> bool:
+        tam_declarado = int.from_bytes(b[2:6], "little")
+        offset_datos = int.from_bytes(b[10:14], "little")
+        ancho = int.from_bytes(b[18:22], "little", signed=True)
+        alto = int.from_bytes(b[22:26], "little", signed=True)
+        planes = int.from_bytes(b[26:28], "little")
+        bpp = int.from_bytes(b[28:30], "little")
+        compresion = int.from_bytes(b[30:34], "little")
+        tam_imagen = int.from_bytes(b[34:38], "little")
+        cabecera_total = 14 + self.dib_size
+
+        if ancho <= 0:
+            self._invalidar("Ancho BMP no positivo")
+            return False
+        if alto == 0 or alto == -(2 ** 31):
+            self._invalidar("Alto BMP inválido")
+            return False
+        if planes != 1:
+            self._invalidar(f"Planos BMP no soportados: {planes}")
+            return False
+        if bpp not in self._BPP_SOPORTADOS:
+            self._invalidar(f"Bits por píxel no soportados: {bpp}")
+            return False
+        if compresion != self._COMPRESION_SOPORTADA:
+            self._invalidar(f"Compresión BMP no soportada: {compresion}")
+            return False
+        if offset_datos < cabecera_total:
+            self._invalidar("Desplazamiento a datos de píxel dentro de la cabecera")
+            return False
+
+        # Fila alineada a DWORD (múltiplo de 4 bytes). Aritmética entera,
+        # sin asignar memoria según las dimensiones declaradas.
+        alto_abs = abs(alto)
+        stride = ((bpp * ancho + 31) // 32) * 4
+        pixel_size = stride * alto_abs
+        if pixel_size <= 0:
+            self._invalidar("Tamaño de datos de píxel nulo")
+            return False
+        if tam_imagen != 0 and tam_imagen != pixel_size:
+            self._invalidar("biSizeImage contradictorio con las dimensiones")
+            return False
+        total = offset_datos + pixel_size
+        if tam_declarado != 0 and tam_declarado != total:
+            self._invalidar("Tamaño de archivo declarado contradictorio")
+            return False
+        if offset_datos >= total or total <= cabecera_total:
+            self._invalidar("Límite BMP no posterior a la cabecera")
+            return False
+
+        self.tamano_total = total
+        self.restante_datos = total - cabecera_total
+        self.estado = self._DATOS
+        return True
+
+    def alimentar(self, data: bytes) -> int:
+        """
+        Procesa un bloque y devuelve cuántos bytes consumió antes de
+        alcanzar el límite validado o de detectar estructura inválida.
+        Todos los bytes consumidos pertenecen al candidato BMP.
+        """
+        i = 0
+        n = len(data)
+        while i < n and not self.fin and not self.invalido:
+            if self.estado == self._CAB:
+                faltan = self._cabecera_objetivo - len(self.buf)
+                tomar = min(faltan, n - i)
+                self.buf += data[i:i + tomar]
+                i += tomar
+                if len(self.buf) == self._cabecera_objetivo:
+                    if not self._procesar_cabecera():
+                        break
+                    if self.estado == self._CAB:
+                        # Ya se conoce el tamaño DIB; seguir acumulando.
+                        continue
+            elif self.estado == self._DATOS:
+                tomar = min(self.restante_datos, n - i)
+                self.restante_datos -= tomar
+                i += tomar
+                if self.restante_datos == 0:
+                    self.fin = True
+        return i
+
+
 class _ParserJPEG:
     """
     Parser estructural incremental y conservador de JPEG.
@@ -489,8 +638,8 @@ class RecuperadorArchivos:
 
                 # Extraer payload real desde el dispositivo
                 extension_actual = archivo.extension.lower()
-                if extension_actual in ("jpg", "png"):
-                    # JPEG/PNG: extracción incremental con memoria acotada
+                if extension_actual in ("jpg", "png", "bmp"):
+                    # JPEG/PNG/BMP: extracción incremental con memoria acotada
                     ruta_origen = self._extraer_ruta_dispositivo(archivo.ruta)
                     if not ruta_origen:
                         print(f"[ERROR] No se pudo determinar dispositivo para {archivo.nombre}")
@@ -501,11 +650,12 @@ class RecuperadorArchivos:
                         )
                         fallidos += 1
                         continue
-                    extractor = (
-                        self._extraer_jpeg_stream
-                        if extension_actual == "jpg"
-                        else self._extraer_png_stream
-                    )
+                    extractores = {
+                        "jpg": self._extraer_jpeg_stream,
+                        "png": self._extraer_png_stream,
+                        "bmp": self._extraer_bmp_stream,
+                    }
+                    extractor = extractores[extension_actual]
                     try:
                         resultado_stream = extractor(
                             ruta_origen, archivo.offset, ruta_destino,
@@ -631,6 +781,8 @@ class RecuperadorArchivos:
             )
         if archivo.extension.lower() == "png":
             return self._construir_evidencia_png(archivo, bytes_escritos, limite_alcanzado)
+        if archivo.extension.lower() == "bmp":
+            return self._construir_evidencia_bmp(archivo, bytes_escritos, limite_alcanzado)
         # Formatos sin validación estructural implementada: siempre estimado
         return EvidenciaRecuperacion(
             tamano_detectado=archivo.tamano,
@@ -670,6 +822,45 @@ class RecuperadorArchivos:
             "Estructura PNG inválida o insuficiente; límite no demostrado"
             if limite_alcanzado == "estructura_invalida"
             else "PNG sin IEND válido dentro del límite operativo; límite no demostrado"
+        )
+        return EvidenciaRecuperacion(
+            tamano_detectado=archivo.tamano,
+            limite_exacto=False,
+            estructura_validada=None,
+            bytes_escritos=bytes_escritos,
+            resultado=ResultadoRecuperacion.ESTIMADO,
+            limite_alcanzado=limite_alcanzado or "fin_fuente",
+            detalle=detalle,
+        )
+
+    def _construir_evidencia_bmp(
+        self,
+        archivo: ArchivoEncontrado,
+        bytes_escritos: int,
+        limite_alcanzado: Optional[str]
+    ) -> EvidenciaRecuperacion:
+        """
+        Evidencia honesta para BMP.
+
+        Un límite derivado de la cabecera validada demuestra la extensión
+        declarada del candidato y valida su estructura de cabecera, pero NO
+        prueba que los píxeles originales estén intactos ni que no exista
+        fragmentación. Por eso el resultado es AMBIGUO, nunca COMPLETO.
+        """
+        if archivo.tamano_exacto is True:
+            return EvidenciaRecuperacion(
+                tamano_detectado=archivo.tamano,
+                limite_exacto=True,
+                estructura_validada=True,
+                bytes_escritos=bytes_escritos,
+                resultado=ResultadoRecuperacion.AMBIGUO,
+                limite_alcanzado=limite_alcanzado or "limite_declarado",
+                detalle="Límite derivado de la cabecera BMP (tamaño declarado y filas alineadas a 4 bytes). No se decodificaron los píxeles: la integridad del contenido no está verificada.",
+            )
+        detalle = (
+            "Estructura BMP inválida o insuficiente; límite no demostrado"
+            if limite_alcanzado == "estructura_invalida"
+            else "BMP sin límite declarado alcanzable dentro del tope operativo; límite no demostrado"
         )
         return EvidenciaRecuperacion(
             tamano_detectado=archivo.tamano,
@@ -985,6 +1176,93 @@ class RecuperadorArchivos:
                 limite_alcanzado="error",
             )
             print(f"[ERROR] Extrayendo PNG de {archivo.nombre}: {e}")
+            return None
+
+    def _extraer_bmp_stream(
+        self,
+        ruta_origen: str,
+        offset: int,
+        ruta_destino: Path,
+        tamano_maximo: int,
+        archivo: ArchivoEncontrado
+    ) -> Optional[tuple[int, str]]:
+        """
+        Extrae un BMP escribiendo incrementalmente en el destino exclusivo.
+
+        - Ventana de lectura de 64 KiB; parser incremental por estados.
+        - El parser valida la cabecera (firma, tamaño DIB, dimensiones,
+          planos, profundidad, compresión, offset y tamaños coherentes) y
+          deriva el límite del archivo de forma aritmética.
+        - Nunca se escribe más allá del límite validado ni del
+          `tamano_maximo` de recursos (100 MiB). Memoria acotada: solo la
+          ventana de lectura y <=138 bytes de cabecera.
+        - Si el tope operativo corta antes del límite declarado, la salida
+          queda con el prefijo leído y se reporta el tope, nunca completitud.
+
+        Returns:
+            (bytes_escritos, limite_alcanzado) o None si falló/canceló.
+        """
+        ventana = 64 * 1024
+        parser = _ParserBMP()
+        escrito = 0
+        leido = 0
+
+        def _limpiar_parcial():
+            try:
+                if ruta_destino.exists():
+                    ruta_destino.unlink()
+            except OSError:
+                pass
+
+        try:
+            with open(ruta_origen, "rb") as src, open(ruta_destino, "xb") as dst:
+                src.seek(offset)
+                while leido < tamano_maximo:
+                    if self._cancelar:
+                        _limpiar_parcial()
+                        archivo.evidencia = EvidenciaRecuperacion(
+                            tamano_detectado=archivo.tamano,
+                            resultado=ResultadoRecuperacion.PARCIAL,
+                            bytes_escritos=0,
+                            detalle="Cancelado durante la escritura; salida parcial eliminada",
+                            limite_alcanzado="cancelado",
+                        )
+                        return None
+                    bloque = src.read(min(ventana, tamano_maximo - leido))
+                    if not bloque:
+                        break
+                    leido += len(bloque)
+                    consumido = parser.alimentar(bloque)
+                    if consumido > 0:
+                        dst.write(bloque[:consumido])
+                        escrito += consumido
+                    if parser.fin:
+                        archivo.tamano_exacto = True
+                        return escrito, "limite_declarado"
+                    if parser.invalido:
+                        archivo.tamano_exacto = False
+                        print(f"[ADVERTENCIA] Estructura BMP no interpretable: {parser.razon}")
+                        return escrito, "estructura_invalida"
+                archivo.tamano_exacto = False
+                limite = "tamano_maximo" if leido >= tamano_maximo else "fin_fuente"
+                return escrito, limite
+        except FileExistsError:
+            archivo.evidencia = EvidenciaRecuperacion(
+                tamano_detectado=archivo.tamano,
+                resultado=ResultadoRecuperacion.FALLIDO,
+                detalle="El archivo ya existía en destino",
+            )
+            raise
+        except Exception as e:
+            _limpiar_parcial()
+            archivo.evidencia = EvidenciaRecuperacion(
+                tamano_detectado=archivo.tamano,
+                resultado=ResultadoRecuperacion.FALLIDO,
+                bytes_escritos=0,
+                detalle=f"Error de E/S: {e}",
+                limite_alcanzado="error",
+            )
+            print(f"[ERROR] Extrayendo BMP de {archivo.nombre}: {e}")
             return None
 
     def _extraer_desde_dispositivo(
