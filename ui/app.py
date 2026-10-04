@@ -42,7 +42,7 @@ class AppPrincipal(ctk.CTk):
         super().__init__()
 
         # Configuración de la ventana
-        self.title("SpiderRecovery - Recuperación de Archivos")
+        self.title("SpiderRecovery - Recuperación de Archivos by JoseLu Web Soluciones")
         self.geometry("1100x700")
         self.minsize(900, 600)
 

@@ -24,12 +24,16 @@ class _ParserPNG:
 
     Valida la firma de 8 bytes, el encuadre de chunks
     (longitud de 4 bytes BE, tipo de 4 bytes, datos, CRC-32),
-    el orden IHDR primero, un único IEND de longitud 0, y la
-    CRC-32 estándar de cada chunk (zlib).
+    el orden IHDR primero, al menos un IDAT, un IEND de longitud 0
+    como último chunk, y la CRC-32 estándar de cada chunk (zlib).
 
-    No decodifica píxeles. Un IEND estructuralmente plausible y
-    CRCs válidas son solo evidencia estructural, no prueba de
-    completitud del original.
+    La memoria es acotada: nunca se reserva memoria proporcional a la
+    longitud declarada por un chunk. Los datos se recorren en rodajas
+    del bloque de entrada, de modo que una longitud enorme o maliciosa
+    no provoca asignaciones grandes.
+
+    No decodifica píxeles. Un IEND con todas las CRC válidas es
+    evidencia estructural, no prueba de integridad del original.
     """
 
     _SIG = 0
@@ -37,9 +41,11 @@ class _ParserPNG:
     _TIPO = 2
     _DATA = 3
     _CRC = 4
-    _FIN = 5
 
     _FIRMA = b"\x89PNG\r\n\x1a\n"
+
+    # Límite de longitud permitido por el estándar PNG (bit superior 0).
+    _LEN_MAXIMA = 0x7FFFFFFF
 
     def __init__(self):
         self.estado = self._SIG
@@ -49,92 +55,138 @@ class _ParserPNG:
         self.crc_buf = bytearray()
         self.restante_data = 0
         self.crc_calculada = 0
+        self.tipo_actual = b""
         self.chunks = 0
         self.visto_ihdr = False
+        self.visto_idat = False
         self.eoi = False  # IEND válido encontrado
         self.invalido = False
         self.razon = ""
         self.crc_mala = False
 
+    def _invalidar(self, razon: str):
+        self.invalido = True
+        self.razon = razon
+
+    def _tipo_valido(self, tipo: bytes) -> bool:
+        """El tipo de chunk debe ser 4 letras ASCII y el bit reservado 0."""
+        for c in tipo:
+            if not ((0x41 <= c <= 0x5A) or (0x61 <= c <= 0x7A)):
+                self._invalidar("Tipo de chunk no alfabético")
+                return False
+        if tipo[2] & 0x20:
+            self._invalidar("Bit reservado activo en el tipo de chunk")
+            return False
+        return True
+
+    def _validar_orden(self, tipo: bytes) -> bool:
+        """Comprueba la posición del chunk dentro de la secuencia PNG."""
+        if self.chunks == 0 and tipo != b"IHDR":
+            self._invalidar("El primer chunk no es IHDR")
+            return False
+        if tipo == b"IHDR":
+            if self.visto_ihdr:
+                self._invalidar("IHDR duplicado")
+                return False
+            if self.restante_data != 13:
+                self._invalidar("IHDR con longitud distinta de 13")
+                return False
+            self.visto_ihdr = True
+        elif tipo == b"IDAT":
+            if not self.visto_ihdr:
+                self._invalidar("IDAT antes de IHDR")
+                return False
+            self.visto_idat = True
+        elif tipo == b"IEND":
+            if not self.visto_ihdr:
+                self._invalidar("IEND antes de IHDR")
+                return False
+            if not self.visto_idat:
+                self._invalidar("IEND sin datos IDAT")
+                return False
+            if self.restante_data != 0:
+                self._invalidar("IEND con longitud distinta de 0")
+                return False
+        return True
+
+    def _chunk_completado(self):
+        self.chunks += 1
+        if self.tipo_actual == b"IEND":
+            self.eoi = True
+            return
+        self.estado = self._LEN
+
     def alimentar(self, data: bytes) -> int:
-        """Procesa un bloque; devuelve cuántos bytes consumió."""
+        """
+        Procesa un bloque y devuelve cuántos bytes consumió antes de
+        detenerse por IEND o por estructura inválida. Todos los bytes
+        consumidos pertenecen al candidato PNG y pueden escribirse tal cual.
+        """
         import zlib
-        consumido = 0
-        for b in data:
-            if self.eoi or self.invalido:
-                break
-            consumido += 1
-            if self.estado == self._SIG:
-                if b != self._FIRMA[self.pos_sig]:
-                    self.invalido, self.razon = True, "Firma PNG incorrecta"
+
+        i = 0
+        n = len(data)
+        while i < n and not self.eoi and not self.invalido:
+            estado = self.estado
+            if estado == self._SIG:
+                while i < n and self.pos_sig < 8:
+                    if data[i] != self._FIRMA[self.pos_sig]:
+                        self._invalidar("Firma PNG incorrecta")
+                        break
+                    self.pos_sig += 1
+                    i += 1
+                if self.invalido:
                     break
-                self.pos_sig += 1
                 if self.pos_sig == 8:
                     self.estado = self._LEN
-            elif self.estado == self._LEN:
-                self.len_buf.append(b)
+            elif estado == self._LEN:
+                tomar = min(4 - len(self.len_buf), n - i)
+                self.len_buf += data[i:i + tomar]
+                i += tomar
                 if len(self.len_buf) == 4:
                     longitud = int.from_bytes(self.len_buf, "big")
-                    if longitud & 0x80000000:
-                        self.invalido, self.razon = True, "Longitud con bit reservado"
+                    self.len_buf.clear()
+                    if longitud > self._LEN_MAXIMA:
+                        self._invalidar("Longitud de chunk con bit reservado activo")
                         break
                     self.restante_data = longitud
-                    self.len_buf.clear()
                     self.estado = self._TIPO
-            elif self.estado == self._TIPO:
-                self.tipo_buf.append(b)
+            elif estado == self._TIPO:
+                tomar = min(4 - len(self.tipo_buf), n - i)
+                self.tipo_buf += data[i:i + tomar]
+                i += tomar
                 if len(self.tipo_buf) == 4:
                     tipo = bytes(self.tipo_buf)
-                    if self.chunks == 0 and tipo != b"IHDR":
-                        self.invalido, self.razon = True, "El primer chunk no es IHDR"
-                        break
-                    if tipo == b"IHDR":
-                        if self.visto_ihdr:
-                            self.invalido, self.razon = True, "IHDR duplicado"
-                            break
-                        if self.restante_data != 13:
-                            self.invalido, self.razon = True, "IHDR con longitud distinta de 13"
-                            break
-                        self.visto_ihdr = True
-                    if tipo == b"IEND" and self.restante_data != 0:
-                        self.invalido, self.razon = True, "IEND con longitud distinta de 0"
-                        break
-                    self.crc_calculada = zlib.crc32(tipo) & 0xFFFFFFFF
                     self.tipo_buf.clear()
-                    self.estado = self._DATA if self.restante_data > 0 else self._CRC
-            elif self.estado == self._DATA:
-                self.crc_calculada = zlib.crc32(bytes([b]), self.crc_calculada) & 0xFFFFFFFF
-                self.restante_data -= 1
+                    if not self._tipo_valido(tipo):
+                        break
+                    self.tipo_actual = tipo
+                    self.crc_calculada = zlib.crc32(tipo) & 0xFFFFFFFF
+                    if not self._validar_orden(tipo):
+                        break
+                    self.estado = self._CRC if self.restante_data == 0 else self._DATA
+            elif estado == self._DATA:
+                tomar = min(self.restante_data, n - i)
+                self.crc_calculada = zlib.crc32(
+                    data[i:i + tomar], self.crc_calculada
+                ) & 0xFFFFFFFF
+                self.restante_data -= tomar
+                i += tomar
                 if self.restante_data == 0:
                     self.estado = self._CRC
-            elif self.estado == self._CRC:
-                self.crc_buf.append(b)
+            elif estado == self._CRC:
+                tomar = min(4 - len(self.crc_buf), n - i)
+                self.crc_buf += data[i:i + tomar]
+                i += tomar
                 if len(self.crc_buf) == 4:
                     declarada = int.from_bytes(self.crc_buf, "big")
                     self.crc_buf.clear()
                     if declarada != self.crc_calculada:
                         self.crc_mala = True
-                        self.invalido, self.razon = True, "CRC de chunk inválida"
+                        self._invalidar("CRC de chunk inválida")
                         break
-                    self.chunks += 1
-                    # IEND ya consumido: fin plausible
-                    if self.chunks > 0 and self.estado != self._FIN:
-                        pass
-                    # Detectar IEND por tipo (última tipo_buf ya limpia): usar flag
-                    self.estado = self._LEN
-                    # Marcar fin si este chunk fue IEND (se detecta abajo)
-                    # (tipo del chunk actual guardado en crc de tipo anterior)
-                    # Simpler: comprobar con el último tipo visto
-                    # (se almacena en _ultimo_tipo)
-                    # -> ver abajo
-                    self._ultimo_tipo_ok = getattr(self, "_ultimo_tipo", b"")
-                    if getattr(self, "_ultimo_tipo", b"") == b"IEND":
-                        self.eoi = True
-                        break
-            # Guardar el tipo actual para la detección de IEND
-            if self.estado == self._DATA or (self.estado == self._CRC and self.chunks == 0):
-                self._ultimo_tipo = bytes(self.tipo_buf) if self.tipo_buf else getattr(self, "_ultimo_tipo", b"")
-        return consumido
+                    self._chunk_completado()
+        return i
 
 
 class _ParserJPEG:
@@ -355,8 +407,9 @@ class RecuperadorArchivos:
                     continue
 
                 # Extraer payload real desde el dispositivo
-                if archivo.extension.lower() == "jpg":
-                    # JPEG: extracción incremental con memoria acotada
+                extension_actual = archivo.extension.lower()
+                if extension_actual in ("jpg", "png"):
+                    # JPEG/PNG: extracción incremental con memoria acotada
                     ruta_origen = self._extraer_ruta_dispositivo(archivo.ruta)
                     if not ruta_origen:
                         print(f"[ERROR] No se pudo determinar dispositivo para {archivo.nombre}")
@@ -367,8 +420,13 @@ class RecuperadorArchivos:
                         )
                         fallidos += 1
                         continue
+                    extractor = (
+                        self._extraer_jpeg_stream
+                        if extension_actual == "jpg"
+                        else self._extraer_png_stream
+                    )
                     try:
-                        resultado_jpeg = self._extraer_jpeg_stream(
+                        resultado_stream = extractor(
                             ruta_origen, archivo.offset, ruta_destino,
                             EscaneoProfundo.TAMANO_MAX_ARCHIVO, archivo
                         )
@@ -379,10 +437,10 @@ class RecuperadorArchivos:
                             resultado=ResultadoRecuperacion.FALLIDO,
                             detalle="El archivo apareció durante la recuperación",
                         )
-                        resultado_jpeg = None
-                    if resultado_jpeg is None:
+                        resultado_stream = None
+                    if resultado_stream is None:
                         fallidos += 1
-                    elif resultado_jpeg[0] == 0:
+                    elif resultado_stream[0] == 0:
                         # Fuente vacía: considerar fallo sin reportar éxito
                         try:
                             if ruta_destino.exists():
@@ -397,7 +455,7 @@ class RecuperadorArchivos:
                         fallidos += 1
                     else:
                         recuperados += 1
-                        bytes_escritos, limite = resultado_jpeg
+                        bytes_escritos, limite = resultado_stream
                         archivo.evidencia = self._construir_evidencia(archivo, bytes_escritos, limite)
                     continue
 
@@ -490,6 +548,8 @@ class RecuperadorArchivos:
                 limite_alcanzado=limite_alcanzado or "marcador_fin",
                 detalle="Límite por EOI tras estructura plausibles interpretada parcialmente (sin decodificar la imagen)",
             )
+        if archivo.extension.lower() == "png":
+            return self._construir_evidencia_png(archivo, bytes_escritos, limite_alcanzado)
         # Formatos sin validación estructural implementada: siempre estimado
         return EvidenciaRecuperacion(
             tamano_detectado=archivo.tamano,
@@ -499,6 +559,45 @@ class RecuperadorArchivos:
             resultado=ResultadoRecuperacion.ESTIMADO,
             limite_alcanzado="fin_fuente_o_maximo",
             detalle="Sin validador estructural para este formato; tamaño acotado por máximo",
+        )
+
+    def _construir_evidencia_png(
+        self,
+        archivo: ArchivoEncontrado,
+        bytes_escritos: int,
+        limite_alcanzado: Optional[str]
+    ) -> EvidenciaRecuperacion:
+        """
+        Evidencia honesta para PNG.
+
+        Un IEND con encuadre y CRCs válidas demuestra el límite del
+        candidato y valida su estructura de chunks, pero NO prueba que el
+        contenido original esté intacto (no se decodifica el flujo zlib ni
+        los filtros). Por eso el resultado es AMBIGUO, nunca COMPLETO.
+        """
+        if archivo.tamano_exacto is True:
+            return EvidenciaRecuperacion(
+                tamano_detectado=archivo.tamano,
+                limite_exacto=True,
+                estructura_validada=True,
+                bytes_escritos=bytes_escritos,
+                resultado=ResultadoRecuperacion.AMBIGUO,
+                limite_alcanzado=limite_alcanzado or "marcador_fin",
+                detalle="IEND con encuadre y CRC-32 válidos; estructura de chunks validada. No se decodificó la imagen: la integridad del contenido no está verificada.",
+            )
+        detalle = (
+            "Estructura PNG inválida o insuficiente; límite no demostrado"
+            if limite_alcanzado == "estructura_invalida"
+            else "PNG sin IEND válido dentro del límite operativo; límite no demostrado"
+        )
+        return EvidenciaRecuperacion(
+            tamano_detectado=archivo.tamano,
+            limite_exacto=False,
+            estructura_validada=None,
+            bytes_escritos=bytes_escritos,
+            resultado=ResultadoRecuperacion.ESTIMADO,
+            limite_alcanzado=limite_alcanzado or "fin_fuente",
+            detalle=detalle,
         )
 
     def _extraer_payload(self, archivo: ArchivoEncontrado) -> Optional[bytes]:
@@ -718,6 +817,93 @@ class RecuperadorArchivos:
                 limite_alcanzado="error",
             )
             print(f"[ERROR] Extrayendo JPEG de {archivo.nombre}: {e}")
+            return None
+
+    def _extraer_png_stream(
+        self,
+        ruta_origen: str,
+        offset: int,
+        ruta_destino: Path,
+        tamano_maximo: int,
+        archivo: ArchivoEncontrado
+    ) -> Optional[tuple[int, str]]:
+        """
+        Extrae un PNG escribiendo incrementalmente en el destino exclusivo.
+
+        - Ventana de lectura de 64 KiB; parser incremental por estados.
+        - Solo se escriben bytes consumidos por el parser (encuadre de
+          chunks con IHDR, al menos un IDAT, CRC-32 válidas e IEND final).
+        - Nunca se escribe más allá del IEND válido ni del `tamano_maximo`
+          de recursos (100 MiB). Memoria acotada: solo la ventana de lectura;
+          el parser no reserva memoria según longitudes declaradas.
+        - Si el IEND cruza el límite del tope operativo no se alcanza a
+          consumir su CRC: la salida queda con el prefijo leído y se
+          reporta el tope, nunca completitud.
+
+        Returns:
+            (bytes_escritos, limite_alcanzado) o None si falló/canceló.
+        """
+        ventana = 64 * 1024
+        parser = _ParserPNG()
+        escrito = 0
+        leido = 0
+
+        def _limpiar_parcial():
+            try:
+                if ruta_destino.exists():
+                    ruta_destino.unlink()
+            except OSError:
+                pass
+
+        try:
+            with open(ruta_origen, "rb") as src, open(ruta_destino, "xb") as dst:
+                src.seek(offset)
+                while leido < tamano_maximo:
+                    if self._cancelar:
+                        _limpiar_parcial()
+                        archivo.evidencia = EvidenciaRecuperacion(
+                            tamano_detectado=archivo.tamano,
+                            resultado=ResultadoRecuperacion.PARCIAL,
+                            bytes_escritos=0,
+                            detalle="Cancelado durante la escritura; salida parcial eliminada",
+                            limite_alcanzado="cancelado",
+                        )
+                        return None
+                    bloque = src.read(min(ventana, tamano_maximo - leido))
+                    if not bloque:
+                        break
+                    leido += len(bloque)
+                    consumido = parser.alimentar(bloque)
+                    if consumido > 0:
+                        dst.write(bloque[:consumido])
+                        escrito += consumido
+                    if parser.eoi:
+                        archivo.tamano_exacto = True
+                        return escrito, "marcador_fin"
+                    if parser.invalido:
+                        archivo.tamano_exacto = False
+                        print(f"[ADVERTENCIA] Estructura PNG no interpretable: {parser.razon}")
+                        return escrito, "estructura_invalida"
+                archivo.tamano_exacto = False
+                limite = "tamano_maximo" if leido >= tamano_maximo else "fin_fuente"
+                return escrito, limite
+        except FileExistsError:
+            archivo.evidencia = EvidenciaRecuperacion(
+                tamano_detectado=archivo.tamano,
+                resultado=ResultadoRecuperacion.FALLIDO,
+                detalle="El archivo ya existía en destino",
+            )
+            raise
+        except Exception as e:
+            _limpiar_parcial()
+            archivo.evidencia = EvidenciaRecuperacion(
+                tamano_detectado=archivo.tamano,
+                resultado=ResultadoRecuperacion.FALLIDO,
+                bytes_escritos=0,
+                detalle=f"Error de E/S: {e}",
+                limite_alcanzado="error",
+            )
+            print(f"[ERROR] Extrayendo PNG de {archivo.nombre}: {e}")
             return None
 
     def _extraer_desde_dispositivo(

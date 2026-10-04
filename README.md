@@ -2,7 +2,7 @@
 
 > Aplicación de escritorio multiplataforma (Linux Fedora y Windows) que recupera archivos eliminados mediante escaneo profundo (File Carving) basado en firmas mágicas.
 
-[![Versión](https://img.shields.io/badge/versión-1.5.3--alpha-blue.svg)](VERSION)
+[![Versión](https://img.shields.io/badge/versión-1.6.5-blue.svg)](VERSION)
 [![Plataforma](https://img.shields.io/badge/plataforma-Linux%20%7C%20Windows-green.svg)](https://fedoraproject.org/)
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 

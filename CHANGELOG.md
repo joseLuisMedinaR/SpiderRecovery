@@ -5,7 +5,7 @@ Todos los cambios notables en este proyecto se documentarán en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/),
 y este proyecto se adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
-## [1.6.5-alpha] - 2026-10-03
+## [1.6.5] - 2026-10-03
 
 ### Añadido
 - Pruebas de robustez del parser/stream JPEG: EOI en múltiples posiciones de borde de 64 KiB, segmento que termina exactamente en el límite de bloque, límite operativo a mitad de marcador, lecturas cortas, error de lectura inyectado, cancelación tras el primer bloque. No se encontraron defectos reproducibles en la auditoría; el comportamiento existente se preservó y se cubrió con regresiones.

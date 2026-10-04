@@ -98,7 +98,7 @@ class PantallaSeleccion(ctk.CTkFrame):
         # Título
         label_titulo = ctk.CTkLabel(
             frame_header,
-            text="SpiderRecovery",
+            text="SpiderRecovery by JoseLu Web Soluciones",
             font=ctk.CTkFont(size=36, weight="bold"),
             text_color="#4FC3F7"
         )
