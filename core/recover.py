@@ -552,6 +552,232 @@ class _ParserJPEG:
         return consumido
 
 
+class _ParserGIF:
+    """
+    Parser estructural incremental y conservador de GIF87a/GIF89a.
+
+    Valida la cabecera de versión, el Logical Screen Descriptor, la Tabla
+    Global de Colores (si el packed de la pantalla la indica), y recorre
+    el cuerpo interpretando descriptores de imagen (0x2C) con sus Tablas
+    Locales de Colores, extensiones (0x21) con sus introductores y
+    longitudes de sub-bloque, los datos de imagen (mínimo LZW + secuencia
+    de sub-bloques terminada en 0x00) y el trailer 0x3B.
+
+    La memoria es acotada: las Tablas de Colores, los descriptores de
+    imagen y los sub-bloques se atraviesan contando bytes, nunca
+    acumulando su contenido; solo se retiene un contador de cada bloque
+    en curso. Las dimensiones de la pantalla se validan sintácticamente
+    pero no se usan para reservar memoria.
+
+    Estructura de extensión: introducer 0x21, etiqueta de 1 byte, y una
+    secuencia de (tamaño, datos[tamaño]) que termina con tamaño 0. Las
+    extensiones con cabecera fija (GCE tamaño 4, Application tamaño 11,
+    Plain Text tamaño 12) validan esa longitud fija en su primer bloque
+    y después continúan con la secuencia de sub-bloques. Los datos de
+    imagen usan la misma secuencia de sub-bloques. Un 0x3B dentro de
+    cualquier payload de datos NO termina el parseo porque el parser no
+    busca bytes, sino que cuadra las longitudes declaradas.
+
+    No decodifica LZW ni píxeles: un trailer válido es evidencia
+    estructural, no prueba de integridad del original.
+    """
+
+    _CABECERA = 0      # firma "GIF87a"/"GIF89a"
+    _LSD = 1           # Logical Screen Descriptor (7 bytes)
+    _GCT = 2           # Global Color Table (si aplica)
+    _BLOQUE = 3        # siguiente introducer: 0x21, 0x2C o 0x3B
+    _EXT_LABEL = 4     # etiqueta de extensión
+    _EXT_PRIMER_BLOQUE = 5
+    _EXT_BLOQUE = 6    # tamaño de sub-bloque de extensión
+    _EXT_DATOS = 7     # datos de sub-bloque de extensión
+    _IMG_DESC = 8      # Image Descriptor (9 bytes)
+    _LCT = 9           # Local Color Table (si aplica)
+    _LZW = 10          # mínimo código LZW (1 byte, 2..8)
+    _IMG_BLOQUE = 11   # tamaño de sub-bloque de datos de imagen
+    _IMG_DATOS = 12    # datos de sub-bloque de imagen
+
+    # Introductores de bloque
+    _EXT = 0x21
+    _SEP_IMAGEN = 0x2C
+    _TRAILER = 0x3B
+
+    # Etiquetas de extensión
+    _ETIQUETA_GCE = 0xF9   # Graphic Control Extension: primer bloque fijo de 4
+    _ETIQUETA_APP = 0xFF   # Application Extension: primer bloque fijo de 11
+    _ETIQUETA_TEXTO = 0x01  # Plain Text Extension: primer bloque fijo de 12
+    _ETIQUETA_COMENTARIO = 0xFE  # Comment Extension: sub-bloques directos
+
+    _FIXTO = {_ETIQUETA_GCE: 4, _ETIQUETA_APP: 11, _ETIQUETA_TEXTO: 12}
+
+    def __init__(self):
+        self.estado = self._CABECERA
+        self.buf = bytearray()          # buffers pequeños de cabecera/LSD/desc
+        self._objetivo = 6              # bytes esperados en el estado actual
+        self.restante = 0               # bytes de tabla/datos por consumir
+        self.etiqueta = 0
+        self._primer_bloque_ext = True
+        self._bloques_ext_ok = False
+        self.imagenes = 0
+        self.extensiones = 0
+        self.vio_trailer = False
+        self.fin = False
+        self.invalido = False
+        self.razon = ""
+
+    def _invalidar(self, razon: str):
+        self.invalido = True
+        self.razon = razon
+
+    def _tabla_tamano(self, bits: int) -> int:
+        """Tamaño en bytes de una tabla de colores de 2^(bits+1) entradas."""
+        return 3 * (1 << (bits + 1))
+
+    def _procesar_cabecera(self) -> bool:
+        if bytes(self.buf) not in (b"GIF87a", b"GIF89a"):
+            self._invalidar("Firma GIF incorrecta o versión no soportada")
+            return False
+        self.estado = self._LSD
+        self._objetivo = 7
+        self.buf.clear()
+        return True
+
+    def _procesar_lsd(self) -> bool:
+        b = bytes(self.buf)
+        self.buf.clear()
+        ancho = int.from_bytes(b[0:2], "little")
+        alto = int.from_bytes(b[2:4], "little")
+        packed = b[4]
+        if ancho == 0 or alto == 0:
+            self._invalidar("Dimensiones de pantalla nulas")
+            return False
+        if packed & 0x80:
+            self.estado = self._GCT
+            self.restante = self._tabla_tamano(packed & 0x07)
+        else:
+            self.estado = self._BLOQUE
+        return True
+
+    def _procesar_descriptor_imagen(self) -> bool:
+        b = bytes(self.buf)
+        self.buf.clear()
+        ancho = int.from_bytes(b[4:6], "little")
+        alto = int.from_bytes(b[6:8], "little")
+        packed = b[8]
+        if ancho == 0 or alto == 0:
+            self._invalidar("Descriptor de imagen con dimensiones nulas")
+            return False
+        self.imagenes += 1
+        if packed & 0x80:
+            self.estado = self._LCT
+            self.restante = self._tabla_tamano(packed & 0x07)
+        else:
+            self.estado = self._LZW
+        return True
+
+    def alimentar(self, data: bytes) -> int:
+        """
+        Procesa un bloque y devuelve cuántos bytes consumió antes de
+        alcanzar el trailer, detectar estructura inválida o agotar el
+        bloque. Todos los bytes consumidos pertenecen al GIF.
+        """
+        i = 0
+        n = len(data)
+        while i < n and not self.fin and not self.invalido:
+            estado = self.estado
+            if estado in (self._CABECERA, self._LSD, self._IMG_DESC):
+                faltan = self._objetivo - len(self.buf)
+                tomar = min(faltan, n - i)
+                self.buf += data[i:i + tomar]
+                i += tomar
+                if len(self.buf) == self._objetivo:
+                    if estado == self._CABECERA:
+                        if not self._procesar_cabecera():
+                            break
+                    elif estado == self._LSD:
+                        if not self._procesar_lsd():
+                            break
+                    else:
+                        if not self._procesar_descriptor_imagen():
+                            break
+            elif estado in (self._GCT, self._LCT):
+                tomar = min(self.restante, n - i)
+                self.restante -= tomar
+                i += tomar
+                if self.restante == 0:
+                    self.estado = self._BLOQUE if estado == self._GCT else self._LZW
+            elif estado == self._BLOQUE:
+                intro = data[i]
+                i += 1
+                if intro == self._EXT:
+                    self.estado = self._EXT_LABEL
+                elif intro == self._SEP_IMAGEN:
+                    self.estado = self._IMG_DESC
+                    self._objetivo = 9
+                    self.buf.clear()
+                elif intro == self._TRAILER:
+                    if self.imagenes == 0:
+                        self._invalidar("Trailer sin ningún descriptor de imagen")
+                        break
+                    self.vio_trailer = True
+                    self.fin = True
+                else:
+                    self._invalidar(f"Introductor de bloque no válido: 0x{intro:02X}")
+                    break
+            elif estado == self._EXT_LABEL:
+                self.etiqueta = data[i]
+                i += 1
+                self.extensiones += 1
+                self._primer_bloque_ext = True
+                self._bloques_ext_ok = False
+                self.estado = self._EXT_BLOQUE
+            elif estado == self._EXT_BLOQUE:
+                tam = data[i]
+                i += 1
+                if tam == 0:
+                    # Terminador de sub-bloques de la extensión
+                    self.estado = self._BLOQUE
+                else:
+                    fijado = self._FIXTO.get(self.etiqueta)
+                    if self._primer_bloque_ext and fijado is not None and tam != fijado:
+                        self._invalidar(
+                            f"Extensión 0x{self.etiqueta:02X} con cabecera fija "
+                            f"de {fijado} bytes, declarada {tam}"
+                        )
+                        break
+                    self._primer_bloque_ext = False
+                    self._bloques_ext_ok = True
+                    self.restante = tam
+                    self.estado = self._EXT_DATOS
+            elif estado == self._EXT_DATOS:
+                tomar = min(self.restante, n - i)
+                self.restante -= tomar
+                i += tomar
+                if self.restante == 0:
+                    self.estado = self._EXT_BLOQUE
+            elif estado == self._LZW:
+                minimo = data[i]
+                i += 1
+                if not (2 <= minimo <= 8):
+                    self._invalidar(f"Tamaño mínimo de código LZW no permitido: {minimo}")
+                    break
+                self.estado = self._IMG_BLOQUE
+            elif estado == self._IMG_BLOQUE:
+                tam = data[i]
+                i += 1
+                if tam == 0:
+                    self.estado = self._BLOQUE
+                else:
+                    self.restante = tam
+                    self.estado = self._IMG_DATOS
+            elif estado == self._IMG_DATOS:
+                tomar = min(self.restante, n - i)
+                self.restante -= tomar
+                i += tomar
+                if self.restante == 0:
+                    self.estado = self._IMG_BLOQUE
+        return i
+
+
 class RecuperadorArchivos:
     """
     Gestiona la recuperación de archivos seleccionados.
@@ -638,7 +864,7 @@ class RecuperadorArchivos:
 
                 # Extraer payload real desde el dispositivo
                 extension_actual = archivo.extension.lower()
-                if extension_actual in ("jpg", "png", "bmp"):
+                if extension_actual in ("jpg", "png", "bmp", "gif"):
                     # JPEG/PNG/BMP: extracción incremental con memoria acotada
                     ruta_origen = self._extraer_ruta_dispositivo(archivo.ruta)
                     if not ruta_origen:
@@ -654,6 +880,7 @@ class RecuperadorArchivos:
                         "jpg": self._extraer_jpeg_stream,
                         "png": self._extraer_png_stream,
                         "bmp": self._extraer_bmp_stream,
+                        "gif": self._extraer_gif_stream,
                     }
                     extractor = extractores[extension_actual]
                     try:
@@ -783,6 +1010,8 @@ class RecuperadorArchivos:
             return self._construir_evidencia_png(archivo, bytes_escritos, limite_alcanzado)
         if archivo.extension.lower() == "bmp":
             return self._construir_evidencia_bmp(archivo, bytes_escritos, limite_alcanzado)
+        if archivo.extension.lower() == "gif":
+            return self._construir_evidencia_gif(archivo, bytes_escritos, limite_alcanzado)
         # Formatos sin validación estructural implementada: siempre estimado
         return EvidenciaRecuperacion(
             tamano_detectado=archivo.tamano,
@@ -861,6 +1090,47 @@ class RecuperadorArchivos:
             "Estructura BMP inválida o insuficiente; límite no demostrado"
             if limite_alcanzado == "estructura_invalida"
             else "BMP sin límite declarado alcanzable dentro del tope operativo; límite no demostrado"
+        )
+        return EvidenciaRecuperacion(
+            tamano_detectado=archivo.tamano,
+            limite_exacto=False,
+            estructura_validada=None,
+            bytes_escritos=bytes_escritos,
+            resultado=ResultadoRecuperacion.ESTIMADO,
+            limite_alcanzado=limite_alcanzado or "fin_fuente",
+            detalle=detalle,
+        )
+
+    def _construir_evidencia_gif(
+        self,
+        archivo: ArchivoEncontrado,
+        bytes_escritos: int,
+        limite_alcanzado: Optional[str]
+    ) -> EvidenciaRecuperacion:
+        """
+        Evidencia honesta para GIF.
+
+        Un trailer 0x3B alcanzado tras una secuencia estructuralmente
+        válida de bloques demuestra el límite del candidato y valida su
+        estructura de cabecera, tablas, descriptores y extensiones, pero
+        NO prueba que los píxeles originales estén intactos (no se
+        decodifica el flujo LZW). Por eso el resultado es AMBIGUO, nunca
+        COMPLETO.
+        """
+        if archivo.tamano_exacto is True:
+            return EvidenciaRecuperacion(
+                tamano_detectado=archivo.tamano,
+                limite_exacto=True,
+                estructura_validada=True,
+                bytes_escritos=bytes_escritos,
+                resultado=ResultadoRecuperacion.AMBIGUO,
+                limite_alcanzado=limite_alcanzado or "marcador_fin",
+                detalle="Trailer GIF alcanzado tras estructura de bloques válida; tablas y extensiones consistentes. No se decodificó el flujo LZW: la integridad del contenido no está verificada.",
+            )
+        detalle = (
+            "Estructura GIF inválida o insuficiente; límite no demostrado"
+            if limite_alcanzado == "estructura_invalida"
+            else "GIF sin trailer válido dentro del límite operativo; límite no demostrado"
         )
         return EvidenciaRecuperacion(
             tamano_detectado=archivo.tamano,
@@ -1263,6 +1533,92 @@ class RecuperadorArchivos:
                 limite_alcanzado="error",
             )
             print(f"[ERROR] Extrayendo BMP de {archivo.nombre}: {e}")
+            return None
+
+    def _extraer_gif_stream(
+        self,
+        ruta_origen: str,
+        offset: int,
+        ruta_destino: Path,
+        tamano_maximo: int,
+        archivo: ArchivoEncontrado
+    ) -> Optional[tuple[int, str]]:
+        """
+        Extrae un GIF escribiendo incrementalmente en el destino exclusivo.
+
+        - Ventana de lectura de 64 KiB; parser incremental por estados.
+        - El parser cuadra cabecera, descriptor lógico, tablas de color,
+          descriptores de imagen, extensiones y sub-bloques hasta el
+          trailer 0x3B; nunca busca el trailer "a ciegas".
+        - Nunca se escribe más allá del trailer válido ni del
+          `tamano_maximo` de recursos (100 MiB). Memoria acotada: solo la
+          ventana de lectura; tablas y sub-bloques se atraviesan contando
+          bytes (sin buffers proporcionales a dimensiones declaradas).
+
+        Returns:
+            (bytes_escritos, limite_alcanzado) o None si falló/canceló.
+        """
+        ventana = 64 * 1024
+        parser = _ParserGIF()
+        escrito = 0
+        leido = 0
+
+        def _limpiar_parcial():
+            try:
+                if ruta_destino.exists():
+                    ruta_destino.unlink()
+            except OSError:
+                pass
+
+        try:
+            with open(ruta_origen, "rb") as src, open(ruta_destino, "xb") as dst:
+                src.seek(offset)
+                while leido < tamano_maximo:
+                    if self._cancelar:
+                        _limpiar_parcial()
+                        archivo.evidencia = EvidenciaRecuperacion(
+                            tamano_detectado=archivo.tamano,
+                            resultado=ResultadoRecuperacion.PARCIAL,
+                            bytes_escritos=0,
+                            detalle="Cancelado durante la escritura; salida parcial eliminada",
+                            limite_alcanzado="cancelado",
+                        )
+                        return None
+                    bloque = src.read(min(ventana, tamano_maximo - leido))
+                    if not bloque:
+                        break
+                    leido += len(bloque)
+                    consumido = parser.alimentar(bloque)
+                    if consumido > 0:
+                        dst.write(bloque[:consumido])
+                        escrito += consumido
+                    if parser.fin:
+                        archivo.tamano_exacto = True
+                        return escrito, "marcador_fin"
+                    if parser.invalido:
+                        archivo.tamano_exacto = False
+                        print(f"[ADVERTENCIA] Estructura GIF no interpretable: {parser.razon}")
+                        return escrito, "estructura_invalida"
+                archivo.tamano_exacto = False
+                limite = "tamano_maximo" if leido >= tamano_maximo else "fin_fuente"
+                return escrito, limite
+        except FileExistsError:
+            archivo.evidencia = EvidenciaRecuperacion(
+                tamano_detectado=archivo.tamano,
+                resultado=ResultadoRecuperacion.FALLIDO,
+                detalle="El archivo ya existía en destino",
+            )
+            raise
+        except Exception as e:
+            _limpiar_parcial()
+            archivo.evidencia = EvidenciaRecuperacion(
+                tamano_detectado=archivo.tamano,
+                resultado=ResultadoRecuperacion.FALLIDO,
+                bytes_escritos=0,
+                detalle=f"Error de E/S: {e}",
+                limite_alcanzado="error",
+            )
+            print(f"[ERROR] Extrayendo GIF de {archivo.nombre}: {e}")
             return None
 
     def _extraer_desde_dispositivo(
