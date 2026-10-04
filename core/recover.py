@@ -856,10 +856,8 @@ class _ParserTIFF:
         visto = set()
         offset = ifd0
         extent = 8
-        strips_offs = None
-        strips_bytes = None
-        tiles_offs = None
-        tiles_bytes = None
+        pares_strips = []   # (offsets, counts) por IFD
+        pares_tiles = []
 
         while offset != 0:
             if offset in visto:
@@ -881,6 +879,9 @@ class _ParserTIFF:
                 self._invalidar("IFD truncado", offset)
                 return False
             extent = max(extent, fin_ifd)
+
+            ifd_strips_offs = ifd_strips_bytes = None
+            ifd_tiles_offs = ifd_tiles_bytes = None
 
             for k in range(n):
                 base = offset + 2 + k * 12
@@ -909,6 +910,13 @@ class _ParserTIFF:
                     valor = ventana[voff:voff + tam]
                     extent = max(extent, voff + tam)
 
+                if tag in (self._TAG_STRIP_OFFS, self._TAG_STRIP_BYTES,
+                           self._TAG_TILE_OFFS, self._TAG_TILE_BYTES):
+                    if tipo not in (3, 4):
+                        self._invalidar(
+                            f"Array de offsets/tamaños con tipo no numérico: {tipo}", base)
+                        return False
+
                 def _array_u32(buf, tipo):
                     # offsets/counts suelen ser SHORT o LONG; aceptamos ambos.
                     paso = 4 if tipo == 4 else 2
@@ -919,21 +927,24 @@ class _ParserTIFF:
                             for i in range(0, len(buf), paso)]
 
                 if tag == self._TAG_STRIP_OFFS:
-                    strips_offs = _array_u32(valor, tipo)
-                    if strips_offs is None:
+                    ifd_strips_offs = _array_u32(valor, tipo)
+                    if ifd_strips_offs is None:
                         return False
                 elif tag == self._TAG_STRIP_BYTES:
-                    strips_bytes = _array_u32(valor, tipo)
-                    if strips_bytes is None:
+                    ifd_strips_bytes = _array_u32(valor, tipo)
+                    if ifd_strips_bytes is None:
                         return False
                 elif tag == self._TAG_TILE_OFFS:
-                    tiles_offs = _array_u32(valor, tipo)
-                    if tiles_offs is None:
+                    ifd_tiles_offs = _array_u32(valor, tipo)
+                    if ifd_tiles_offs is None:
                         return False
                 elif tag == self._TAG_TILE_BYTES:
-                    tiles_bytes = _array_u32(valor, tipo)
-                    if tiles_bytes is None:
+                    ifd_tiles_bytes = _array_u32(valor, tipo)
+                    if ifd_tiles_bytes is None:
                         return False
+
+            pares_strips.append((ifd_strips_offs, ifd_strips_bytes))
+            pares_tiles.append((ifd_tiles_offs, ifd_tiles_bytes))
 
             offset = u32(fin_ifd - 4)
 
@@ -960,10 +971,12 @@ class _ParserTIFF:
                     extent = max(extent, fin)
             return True
 
-        if not _revisar_rangos(strips_offs, strips_bytes, "Strips"):
-            return False
-        if not _revisar_rangos(tiles_offs, tiles_bytes, "Tiles"):
-            return False
+        for offs, counts in pares_strips:
+            if not _revisar_rangos(offs, counts, "Strips"):
+                return False
+        for offs, counts in pares_tiles:
+            if not _revisar_rangos(offs, counts, "Tiles"):
+                return False
 
         self.ok = True
         self.validada = True

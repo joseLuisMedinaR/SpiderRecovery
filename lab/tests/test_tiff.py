@@ -468,5 +468,198 @@ class TestLimitesDeRecuperacion(unittest.TestCase):
         self.assertEqual(encontrados[0].extension, "tiff")
 
 
+
+def _tiff_dos_paginas() -> bytes:
+    """TIFF de dos páginas: page0 referencia un strip POSTERIOR al de page1,
+
+
+    de modo que un parser que solo conservara los arrays del último IFD
+    quedaría con un extent menor del necesario.
+    """
+    e = "<"
+    n_ent = 3
+    ifd0_off = 8
+    ifd1_off = ifd0_off + 2 + n_ent * 12 + 4
+    fin_ifd1 = ifd1_off + 2 + n_ent * 12 + 4
+    strip1_off = fin_ifd1
+    strip1 = b"\x11" * 8
+    gap = b"\xCC" * 16
+    strip0_off = strip1_off + len(strip1) + len(gap)
+    strip0 = b"\x22" * 8
+    ifd0 = _u16(e, n_ent)
+    for tag, tipo, cuenta, valor in [
+        (256, 4, 1, _u32(e, 2)),
+        (273, 4, 1, _u32(e, strip0_off)),
+        (279, 4, 1, _u32(e, len(strip0))),
+    ]:
+        ifd0 += _entrada(e, tag, tipo, cuenta, valor)
+    ifd0 += _u32(e, ifd1_off)
+    ifd1 = _u16(e, n_ent)
+    for tag, tipo, cuenta, valor in [
+        (256, 4, 1, _u32(e, 2)),
+        (273, 4, 1, _u32(e, strip1_off)),
+        (279, 4, 1, _u32(e, len(strip1))),
+    ]:
+        ifd1 += _entrada(e, tag, tipo, cuenta, valor)
+    ifd1 += _u32(e, 0)
+    cabecera = b"II\x2a\x00" + _u32(e, ifd0_off)
+    return cabecera + ifd0 + ifd1 + strip1 + gap + strip0
+
+
+def _tiff_tile() -> bytes:
+    """TIFF con tiles en lugar de strips."""
+    e = "<"
+    tile = b"\x77" * 32
+    n = 4
+    off_tile = 8 + 2 + n * 12 + 4 + 4
+    entradas = [
+        (256, 4, 1, _u32(e, 4)),
+        (257, 4, 1, _u32(e, 4)),
+        (324, 4, 1, _u32(e, off_tile)),
+        (325, 4, 1, _u32(e, len(tile))),
+    ]
+    cuerpo_ifd = _u16(e, len(entradas))
+    for tag, tipo, cuenta, valor in entradas:
+        cuerpo_ifd += _entrada(e, tag, tipo, cuenta, valor)
+    cuerpo_ifd += _u32(e, 0)
+    cabecera = b"II\x2a\x00" + _u32(e, 8)
+    return cabecera + cuerpo_ifd + b"\x00" * 4 + tile
+
+
+class TestAuditoriaTiff(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_extent_cubre_strips_de_todas_las_paginas(self):
+        fixture = _tiff_dos_paginas()
+        p = _ParserTIFF()
+        self.assertTrue(p.analizar(fixture, len(fixture)), p.razon)
+        # El extent debe llegar al final del strip de la página 0
+        self.assertEqual(p.extent, len(fixture))
+
+    def test_dos_paginas_recuperacion_byte_exacta_del_extent(self):
+        fixture = _tiff_dos_paginas()
+        src = self.base / "src"; src.mkdir(exist_ok=True)
+        fuente = src / "dos.tif"
+        fuente.write_bytes(fixture)
+        entrada = arch_tiff(str(fuente), nombre="dos.tif", tamano=len(fixture))
+        dest = tempfile.mkdtemp(dir=DEST_TMPFS if DEST_TMPFS.is_dir() else None)
+        rec, fal = RecuperadorArchivos().recuperar_archivos([entrada], dest)
+        self.assertEqual((rec, fal), (1, 0))
+        salidas = list(Path(dest).rglob("*.tif"))
+        self.assertEqual(len(salidas), 1)
+        self.assertEqual(salidas[0].read_bytes(), fixture)
+        self.assertEqual(entrada.evidencia.bytes_escritos, len(fixture))
+        import shutil; shutil.rmtree(dest, ignore_errors=True)
+
+    def test_tipo_no_numerico_en_array_de_strips_rechazado(self):
+        e = "<"
+        entradas = [
+            (256, 4, 1, _u32(e, 2)),
+            (273, 2, 1, _u32(e, 0)),   # StripOffsets como ASCII -> inválido
+            (279, 4, 1, _u32(e, 4)),
+        ]
+        fi = _tiff(entradas=entradas)
+        p = _ParserTIFF()
+        self.assertFalse(p.analizar(fi, len(fi)))
+        self.assertIn("no numérico", p.razon)
+
+    def test_longitudes_de_arrays_strips_incoherentes(self):
+        e = "<"
+        # 273 (2 offsets en array) vs 279 (1 tamaño inline): longitudes distintas
+        arr = _u32(e, 60) + _u32(e, 70)
+        entradas = [
+            (273, 4, 2, _u32(e, 8 + 2 + 2 * 12 + 4)),  # offset al array
+            (279, 4, 1, _u32(e, 4)),                    # un tamaño inline
+        ]
+        cuerpo = _u16(e, len(entradas))
+        for tag, tipo, cuenta, valor in entradas:
+            cuerpo += _entrada(e, tag, tipo, cuenta, valor)
+        cuerpo += _u32(e, 0)
+        fi = b"II\x2a\x00" + _u32(e, 8) + cuerpo + arr + b"\x00" * (60 - (8 + len(cuerpo) + 8)) + b"\x00" * 8
+        p = _ParserTIFF()
+        self.assertFalse(p.analizar(fi, len(fi)))
+        self.assertIn("incoherente", p.razon)
+
+    def test_ifd0_mas_alla_de_la_ventana_es_conservador(self):
+        # Documento: metadatos fuera de la ventana de 1 MiB NO producen una
+        # recuperación presentada como válida; estructura_invalida.
+        e = "<"
+        ifd_fuera = 1 * 1024 * 1024 + 512
+        fi = b"II\x2a\x00" + _u32(e, ifd_fuera) + b"\x00" * (ifd_fuera + 64)
+        src = self.base / "src"; src.mkdir(exist_ok=True)
+        fuente = src / "lejana.tif"
+        fuente.write_bytes(fi)
+        entrada = arch_tiff(str(fuente), nombre="lejana.tif", tamano=len(fi))
+        dest = tempfile.mkdtemp(dir=DEST_TMPFS if DEST_TMPFS.is_dir() else None)
+        rec, fal = RecuperadorArchivos().recuperar_archivos([entrada], dest)
+        self.assertEqual((rec, fal), (1, 0))
+        self.assertFalse(entrada.tamano_exacto)
+        self.assertEqual(entrada.evidencia.resultado, ResultadoRecuperacion.ESTIMADO)
+        self.assertEqual(entrada.evidencia.limite_alcanzado, "estructura_invalida")
+        import shutil; shutil.rmtree(dest, ignore_errors=True)
+
+    def test_tile_basado_es_parseable(self):
+        fixture = _tiff_tile()
+        p = _ParserTIFF()
+        self.assertTrue(p.analizar(fixture, len(fixture)), p.razon)
+        self.assertEqual(p.extent, len(fixture))
+
+    def test_ifd_vacia_sin_strips(self):
+        e = "<"
+        cabecera = b"II\x2a\x00" + _u32(e, 8)
+        cuerpo = _u16(e, 0) + _u32(e, 0)  # 0 entradas, next = 0
+        fi = cabecera + cuerpo
+        p = _ParserTIFF()
+        self.assertTrue(p.analizar(fi, len(fi)), p.razon)
+        self.assertEqual(p.extent, 8 + 6)
+
+    def test_disponible_desconocido_permite_extent(self):
+        fixture = _tiff_minimo("<")
+        p = _ParserTIFF()
+        self.assertTrue(p.analizar(fixture, None))
+        self.assertEqual(p.extent, len(fixture))
+
+    def test_tiff_real_con_pil_si_disponible(self):
+        import shutil, subprocess
+        python = shutil.which("python3")
+        rutas = []
+        if python:
+            script = self.base / "_gentiff.py"
+            script.write_text(
+                "from PIL import Image\n"
+                f"Image.new('RGB', (8, 8), (1, 2, 3)).save(r'{self.base}/real.tif', 'TIFF')\n"
+            )
+            try:
+                subprocess.run([python, str(script)], check=True,
+                               capture_output=True, timeout=60)
+                rutas = [self.base / "real.tif"]
+            except Exception:
+                rutas = []
+            try:
+                script.unlink()
+            except OSError:
+                pass
+        if not rutas:
+            self.skipTest("PIL del sistema no disponible para generar TIFF real")
+        datos = rutas[0].read_bytes()
+        p = _ParserTIFF()
+        self.assertTrue(p.analizar(datos, len(datos)), p.razon)
+        src = self.base / "src"; src.mkdir(exist_ok=True)
+        fuente = src / "real.tif"
+        fuente.write_bytes(datos)
+        entrada = arch_tiff(str(fuente), nombre="real.tif", tamano=len(datos))
+        dest = tempfile.mkdtemp(dir=DEST_TMPFS if DEST_TMPFS.is_dir() else None)
+        rec, fal = RecuperadorArchivos().recuperar_archivos([entrada], dest)
+        self.assertEqual((rec, fal), (1, 0))
+        salidas = list(Path(dest).rglob("*.tif"))
+        self.assertEqual(datos[:len(salidas[0].read_bytes())], salidas[0].read_bytes())
+        self.assertEqual(entrada.evidencia.resultado, ResultadoRecuperacion.ESTIMADO)
+        import shutil; shutil.rmtree(dest, ignore_errors=True)
+
 if __name__ == "__main__":
     unittest.main()
